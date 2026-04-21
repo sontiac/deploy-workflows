@@ -109,11 +109,15 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Set up SSH
+        env:
+          DEPLOY_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
         run: |
           mkdir -p ~/.ssh
-          echo "${{ secrets.DEPLOY_SSH_KEY }}" > ~/.ssh/deploy_key
+          printf '%s\n' "$DEPLOY_KEY" > ~/.ssh/deploy_key
           chmod 600 ~/.ssh/deploy_key
           ssh-keyscan -H ${{ inputs.vps_host }} >> ~/.ssh/known_hosts 2>/dev/null
+          # Validate key format before use
+          ssh-keygen -y -f ~/.ssh/deploy_key > /dev/null && echo "SSH key OK"
 
       - name: Remote pull + install + build + migrate + restart
         env:
