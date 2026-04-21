@@ -113,10 +113,14 @@ jobs:
           DEPLOY_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
         run: |
           mkdir -p ~/.ssh
-          printf '%s\n' "$DEPLOY_KEY" > ~/.ssh/deploy_key
+          # Accept either raw PEM or base64-encoded key (base64 avoids GitHub Secret multi-line paste issues)
+          if printf '%s' "$DEPLOY_KEY" | head -c 10 | grep -q '^---'; then
+            printf '%s\n' "$DEPLOY_KEY" > ~/.ssh/deploy_key
+          else
+            printf '%s' "$DEPLOY_KEY" | base64 -d > ~/.ssh/deploy_key
+          fi
           chmod 600 ~/.ssh/deploy_key
           ssh-keyscan -H ${{ inputs.vps_host }} >> ~/.ssh/known_hosts 2>/dev/null
-          # Validate key format before use
           ssh-keygen -y -f ~/.ssh/deploy_key > /dev/null && echo "SSH key OK"
 
       - name: Remote pull + install + build + migrate + restart
