@@ -1,0 +1,110 @@
+name: Deploy Static Site
+
+on:
+  workflow_call:
+    inputs:
+      app_name:
+        required: true
+        type: string
+      health_url:
+        required: true
+        type: string
+      working_dir:
+        required: false
+        type: string
+        default: "."
+      dist_dir:
+        description: "Directory produced by the build, relative to working_dir."
+        required: false
+        type: string
+        default: "dist"
+      remote_path:
+        description: "Absolute path on VPS where the site is served from (Caddy file_server target)."
+        required: true
+        type: string
+      build_cmd:
+        required: false
+        type: string
+        default: "npm run build"
+      node_version:
+        required: false
+        type: string
+        default: "22"
+      vps_host:
+        required: false
+        type: string
+        default: "5.78.146.204"
+      vps_user:
+        required: false
+        type: string
+        default: "kenneth"
+      skip_security:
+        required: false
+        type: boolean
+        default: false
+    secrets:
+      DEPLOY_SSH_KEY:
+        required: true
+
+concurrency:
+  group: deploy-${{ inputs.app_name }}
+  cancel-in-progress: false
+
+jobs:
+  security:
+    if: ${{ !inputs.skip_security }}
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: ${{ inputs.working_dir }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ inputs.node_version }}
+          cache: npm
+          cache-dependency-path: ${{ inputs.working_dir }}/package-lock.json
+      - run: npm audit --omit=dev --audit-level=high
+      - uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+
+  deploy:
+    needs: [security]
+    if: ${{ always() && (needs.security.result == 'success' || needs.security.result == 'skipped') }}
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: ${{ inputs.working_dir }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ inputs.node_version }}
+          cache: npm
+          cache-dependency-path: ${{ inputs.working_dir }}/package-lock.json
+
+      - run: npm ci --no-audit --no-fund
+      - run: ${{ inputs.build_cmd }}
+
+      - name: Ship dist via rsync
+        env:
+          DEPLOY_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+        run: |
+          mkdir -p ~/.ssh
+          echo "$DEPLOY_KEY" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+          ssh-keyscan -H ${{ inputs.vps_host }} >> ~/.ssh/known_hosts 2>/dev/null
+          rsync -az --delete -e "ssh -i ~/.ssh/deploy_key" \
+            ${{ inputs.dist_dir }}/ \
+            ${{ inputs.vps_user }}@${{ inputs.vps_host }}:${{ inputs.remote_path }}/
+
+      - name: Health check
+        run: |
+          for i in 1 2 3; do
+            sleep 3
+            CODE=$(curl -s -o /dev/null -w "%{http_code}" "${{ inputs.health_url }}")
+            echo "HTTP $CODE"
+            [[ "$CODE" =~ ^[23] ]] && exit 0
+          done
+          exit 1

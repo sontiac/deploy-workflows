@@ -1,0 +1,179 @@
+name: Deploy Node App
+
+on:
+  workflow_call:
+    inputs:
+      app_name:
+        description: "pm2 process name, used for restart and artifact path."
+        required: true
+        type: string
+      app_port:
+        description: "Port the app listens on (used for health check)."
+        required: true
+        type: number
+      health_url:
+        description: "Public URL to GET after deploy; must return 2xx/3xx."
+        required: true
+        type: string
+      working_dir:
+        description: "Subdirectory in the repo containing package.json. Defaults to repo root."
+        required: false
+        type: string
+        default: "."
+      has_prisma:
+        description: "If true, run 'prisma migrate deploy' before restart."
+        required: false
+        type: boolean
+        default: false
+      prisma_schema_dir:
+        description: "Directory where prisma schema lives (prisma migrate deploy is run from here)."
+        required: false
+        type: string
+        default: "."
+      node_version:
+        description: "Node.js major version."
+        required: false
+        type: string
+        default: "22"
+      vps_host:
+        description: "VPS hostname/IP."
+        required: false
+        type: string
+        default: "5.78.146.204"
+      vps_user:
+        description: "SSH user on VPS."
+        required: false
+        type: string
+        default: "kenneth"
+      remote_path:
+        description: "Absolute path on VPS where the repo is checked out."
+        required: true
+        type: string
+      build_cmd:
+        description: "Build command run before deploy."
+        required: false
+        type: string
+        default: "npm run build"
+      skip_security:
+        description: "Skip security scan job. Use only for emergencies."
+        required: false
+        type: boolean
+        default: false
+    secrets:
+      DEPLOY_SSH_KEY:
+        description: "Private SSH key matching the deploy public key on the VPS."
+        required: true
+
+concurrency:
+  group: deploy-${{ inputs.app_name }}
+  cancel-in-progress: false
+
+jobs:
+  security:
+    if: ${{ !inputs.skip_security }}
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: ${{ inputs.working_dir }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ inputs.node_version }}
+          cache: npm
+          cache-dependency-path: ${{ inputs.working_dir }}/package-lock.json
+      - name: npm audit (fail on high+)
+        run: npm audit --omit=dev --audit-level=high
+        continue-on-error: false
+      - name: gitleaks
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+
+  deploy:
+    needs: [security]
+    if: ${{ always() && (needs.security.result == 'success' || needs.security.result == 'skipped') }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up SSH
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.DEPLOY_SSH_KEY }}" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+          ssh-keyscan -H ${{ inputs.vps_host }} >> ~/.ssh/known_hosts 2>/dev/null
+
+      - name: Remote pull + install + build + migrate + restart
+        env:
+          SSH: ssh -i ~/.ssh/deploy_key -o StrictHostKeyChecking=no ${{ inputs.vps_user }}@${{ inputs.vps_host }}
+          APP: ${{ inputs.app_name }}
+          PATH_REMOTE: ${{ inputs.remote_path }}
+          WDIR: ${{ inputs.working_dir }}
+          BUILD: ${{ inputs.build_cmd }}
+          HAS_PRISMA: ${{ inputs.has_prisma }}
+          PRISMA_DIR: ${{ inputs.prisma_schema_dir }}
+          COMMIT: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          $SSH bash -s <<EOF
+            set -euo pipefail
+            cd "$PATH_REMOTE"
+
+            echo "==> git fetch + reset"
+            git fetch --depth=1 origin ${{ github.ref_name }}
+            PREV_COMMIT=\$(git rev-parse HEAD)
+            git reset --hard ${{ github.sha }}
+            echo "previous=\$PREV_COMMIT" > /tmp/deploy-$APP.rollback
+
+            cd "$WDIR"
+            echo "==> npm ci"
+            npm ci --no-audit --no-fund
+
+            if [ "$HAS_PRISMA" = "true" ]; then
+              echo "==> prisma migrate deploy"
+              cd "$PATH_REMOTE/$PRISMA_DIR"
+              npx prisma migrate deploy
+              cd "$PATH_REMOTE/$WDIR"
+            fi
+
+            echo "==> build"
+            $BUILD
+
+            echo "==> pm2 restart"
+            pm2 restart $APP --update-env
+            pm2 save
+          EOF
+
+      - name: Health check
+        id: healthcheck
+        run: |
+          set +e
+          for i in 1 2 3 4 5 6; do
+            sleep 5
+            CODE=$(curl -k -s -o /dev/null -w "%{http_code}" "${{ inputs.health_url }}" || echo 000)
+            echo "Attempt $i → HTTP $CODE"
+            if [[ "$CODE" =~ ^[23] ]]; then
+              echo "status=ok" >> $GITHUB_OUTPUT
+              exit 0
+            fi
+          done
+          echo "status=fail" >> $GITHUB_OUTPUT
+          exit 1
+
+      - name: Rollback on failure
+        if: failure() && steps.healthcheck.outputs.status == 'fail'
+        run: |
+          ssh -i ~/.ssh/deploy_key -o StrictHostKeyChecking=no ${{ inputs.vps_user }}@${{ inputs.vps_host }} bash -s <<EOF
+            set -euo pipefail
+            cd "${{ inputs.remote_path }}"
+            if [ -f /tmp/deploy-${{ inputs.app_name }}.rollback ]; then
+              PREV=\$(cat /tmp/deploy-${{ inputs.app_name }}.rollback | cut -d= -f2)
+              echo "Rolling back to \$PREV"
+              git reset --hard \$PREV
+              cd "${{ inputs.working_dir }}"
+              npm ci --no-audit --no-fund
+              ${{ inputs.build_cmd }}
+              pm2 restart ${{ inputs.app_name }} --update-env
+            fi
+          EOF
