@@ -63,7 +63,7 @@ on:
         description: "Block deploy when npm audit finds issues at this level or higher. One of: never, critical, high, moderate, low."
         required: false
         type: string
-        default: "never"
+        default: "critical"
     secrets:
       DEPLOY_SSH_KEY:
         description: "Private SSH key matching the deploy public key on the VPS."

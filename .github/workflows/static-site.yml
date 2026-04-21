@@ -46,7 +46,7 @@ on:
         description: "Block deploy when npm audit finds issues at this level. One of: never, critical, high, moderate, low."
         required: false
         type: string
-        default: "never"
+        default: "critical"
     secrets:
       DEPLOY_SSH_KEY:
         required: true
