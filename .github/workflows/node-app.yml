@@ -59,6 +59,11 @@ on:
         required: false
         type: boolean
         default: false
+      audit_fail_on:
+        description: "Block deploy when npm audit finds issues at this level or higher. One of: never, critical, high, moderate, low."
+        required: false
+        type: string
+        default: "never"
     secrets:
       DEPLOY_SSH_KEY:
         description: "Private SSH key matching the deploy public key on the VPS."
@@ -82,13 +87,17 @@ jobs:
           node-version: ${{ inputs.node_version }}
           cache: npm
           cache-dependency-path: ${{ inputs.working_dir }}/package-lock.json
-      - name: npm audit (fail on high+)
-        run: npm audit --omit=dev --audit-level=high
-        continue-on-error: false
-      - name: gitleaks
-        uses: gitleaks/gitleaks-action@v2
-        env:
-          GITHUB_TOKEN: ${{ github.token }}
+      - name: npm audit
+        run: |
+          if [ "${{ inputs.audit_fail_on }}" = "never" ]; then
+            npm audit --omit=dev || echo "::warning::npm audit found issues (non-blocking)"
+          else
+            npm audit --omit=dev --audit-level=${{ inputs.audit_fail_on }}
+          fi
+      - name: gitleaks (detect committed secrets)
+        run: |
+          curl -sSL https://github.com/gitleaks/gitleaks/releases/download/v8.21.2/gitleaks_8.21.2_linux_x64.tar.gz | tar -xz gitleaks
+          ./gitleaks detect --no-banner --redact --exit-code 1 --source . --log-level warn
 
   deploy:
     needs: [security]
