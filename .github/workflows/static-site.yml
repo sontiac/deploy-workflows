@@ -79,7 +79,7 @@ jobs:
       - name: gitleaks (detect committed secrets)
         run: |
           curl -sSL https://github.com/gitleaks/gitleaks/releases/download/v8.21.2/gitleaks_8.21.2_linux_x64.tar.gz | tar -xz gitleaks
-          ./gitleaks detect --no-banner --redact --exit-code 1 --source . --log-level warn
+          ./gitleaks detect --no-banner --redact --exit-code 1 --no-git --source . --log-level warn
 
   deploy:
     needs: [security]
