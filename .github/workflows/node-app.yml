@@ -120,7 +120,10 @@ jobs:
             printf '%s' "$DEPLOY_KEY" | base64 -d > ~/.ssh/deploy_key
           fi
           chmod 600 ~/.ssh/deploy_key
-          ssh-keyscan -H ${{ inputs.vps_host }} >> ~/.ssh/known_hosts 2>/dev/null
+          if ! ssh-keyscan -H ${{ inputs.vps_host }} >> ~/.ssh/known_hosts; then
+            echo "::error::ssh-keyscan could not reach ${{ inputs.vps_host }}:22 — is the VPS firewall blocking GitHub runners?"
+            exit 1
+          fi
           ssh-keygen -y -f ~/.ssh/deploy_key > /dev/null && echo "SSH key OK"
 
       - name: Remote pull + install + build + migrate + restart
