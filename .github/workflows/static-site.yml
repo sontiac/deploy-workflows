@@ -63,8 +63,8 @@ jobs:
       run:
         working-directory: ${{ inputs.working_dir }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@v6
+      - uses: actions/setup-node@v6
         with:
           node-version: ${{ inputs.node_version }}
           cache: npm
@@ -89,8 +89,8 @@ jobs:
       run:
         working-directory: ${{ inputs.working_dir }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@v6
+      - uses: actions/setup-node@v6
         with:
           node-version: ${{ inputs.node_version }}
           cache: npm
