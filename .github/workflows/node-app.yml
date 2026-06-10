@@ -105,11 +105,6 @@ jobs:
     needs: [security]
     if: ${{ always() && (needs.security.result == 'success' || needs.security.result == 'skipped') }}
     runs-on: ubuntu-latest
-    # Serialize deploys per app: concurrent runs collide on the server
-    # (parallel git fetch/reset + npm ci in the same checkout).
-    concurrency:
-      group: deploy-${{ inputs.app_name }}
-      cancel-in-progress: false
     steps:
       - uses: actions/checkout@v6
 
