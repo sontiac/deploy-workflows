@@ -52,7 +52,7 @@ on:
         required: true
 
 concurrency:
-  group: deploy-${{ inputs.app_name }}
+  group: deploy-debug-static
   cancel-in-progress: false
 
 jobs:
@@ -88,7 +88,7 @@ jobs:
     # Serialize deploys per app: concurrent runs collide on the server
     # (parallel git fetch/reset + npm ci in the same checkout).
     concurrency:
-      group: deploy-${{ inputs.app_name }}
+      group: deploy-debug-static
       cancel-in-progress: false
     defaults:
       run:
