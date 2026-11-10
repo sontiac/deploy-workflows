@@ -225,7 +225,7 @@ else
   done <<<"$AUDIT_DIRS"
   if command -v gitleaks >/dev/null 2>&1; then
     say "gitleaks"
-    gitleaks detect --no-banner --redact --exit-code 1 --no-git --source "$EXPORT" --log-level warn ||
+    gitleaks detect --no-banner --redact --verbose --exit-code 1 --no-git --source "$EXPORT" --log-level warn ||
       die "gitleaks found committed secrets; nothing was deployed"
   else
     say "gitleaks is NOT installed: secret scan SKIPPED (brew install gitleaks)"
