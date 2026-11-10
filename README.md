@@ -138,6 +138,7 @@ relative to `working_dir`. The live commit is recorded on the VPS in
 - `bin/deploy`: the command (bash, also runs on macOS's bash 3.2).
 - `lib/validate-config.jq`: the `deploy.json` checks.
 - `lib/remote/`: the job that runs on the VPS; `common.sh` plus one file per type.
+- `test/e2e.sh`: end-to-end test against a Docker container standing in for the VPS (good deploy, failed build, failed health check, lock, refusals, static site). Run it after changing the tool; it never touches the real VPS.
 
 The reusable GitHub Actions workflows this repository used to hold
 (`node-app.yml`, `static-site.yml`) were removed on Nov 9, 2026; they are in
