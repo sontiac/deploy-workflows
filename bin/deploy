@@ -1,0 +1,322 @@
+#!/usr/bin/env bash
+# deploy: ship this repository's origin/main to production, from your Mac.
+#
+# Run it anywhere inside an app's git repository. It reads deploy.json from
+# the commit being deployed (origin/main), runs the security checks locally,
+# then runs the deploy on the VPS under a per-app lock, with a health check
+# and an automatic rollback. README.md in this tool's repository documents
+# deploy.json and the exit codes.
+#
+# Written for bash 3.2 too (the /bin/bash macOS ships).
+
+set -euo pipefail
+
+usage() {
+  cat <<'EOF'
+Usage: deploy [--dry-run] [--skip-security]
+
+Deploys origin/main of the git repository you are in, as described by the
+deploy.json committed on origin/main.
+
+  --dry-run         Print the plan (what would ship, what production runs now,
+                    every step) and stop. Changes nothing.
+  --skip-security   Skip npm audit and gitleaks. Emergencies only.
+  -h, --help        Show this help.
+
+Exit codes:
+   0  deployed and healthy
+   1  refused on this Mac; nothing was changed
+  10  refused on the VPS (production moved, fetch failed, ...); nothing was changed
+  11  another deploy of this app is running; nothing was changed
+  20  the deploy failed and was rolled back; production is healthy on the previous version
+  30  the deploy failed AND the rollback failed; production may be down
+  40  lost the connection to the VPS; the deploy keeps running there
+  99  the remote job ended unexpectedly; read its log
+EOF
+}
+
+# Exit codes shared with lib/remote/common.sh.
+readonly EXIT_OK=0 EXIT_LOCAL_REFUSAL=1 EXIT_REFUSED=10 EXIT_LOCKED=11
+readonly EXIT_ROLLED_BACK=20 EXIT_ROLLBACK_FAILED=30 EXIT_DISCONNECTED=40 EXIT_UNKNOWN=99
+
+readonly DEPLOY_BRANCH=main
+readonly CONFIG_FILE=deploy.json
+SSH_OPTS=(-T -o BatchMode=yes -o ServerAliveInterval=15 -o ServerAliveCountMax=4)
+
+die() {
+  printf 'deploy: %s\n' "$*" >&2
+  exit "$EXIT_LOCAL_REFUSAL"
+}
+say() { printf '%s\n' "$*"; }
+heading() { printf '\n==> %s\n' "$*"; }
+field() { printf '  %-12s %s\n' "$1" "$2"; }
+
+# The tool's own directory, following the ~/.local/bin symlink (no readlink -f on bash 3.2 macOS).
+tool_root() {
+  local source=${BASH_SOURCE[0]} dir
+  while [ -L "$source" ]; do
+    dir=$(cd -P "$(dirname "$source")" && pwd)
+    source=$(readlink "$source")
+    case $source in /*) ;; *) source="$dir/$source" ;; esac
+  done
+  cd -P "$(dirname "$source")/.." && pwd
+}
+
+require_commands() {
+  local cmd
+  for cmd in "$@"; do
+    command -v "$cmd" >/dev/null 2>&1 || die "'$cmd' is required but not installed"
+  done
+}
+
+remote() { ssh "${SSH_OPTS[@]}" "$HOST" "$@"; }
+
+# ---------------------------------------------------------------- arguments
+
+DRY_RUN=false
+SKIP_SECURITY=false
+while [ $# -gt 0 ]; do
+  case $1 in
+    --dry-run) DRY_RUN=true ;;
+    --skip-security) SKIP_SECURITY=true ;;
+    -h | --help) usage; exit 0 ;;
+    *) usage >&2; exit "$EXIT_LOCAL_REFUSAL" ;;
+  esac
+  shift
+done
+
+ROOT=$(tool_root)
+readonly ROOT
+require_commands git jq ssh npm tar
+
+REPO=$(git rev-parse --show-toplevel 2>/dev/null) || die "run deploy inside an app's git repository"
+cd "$REPO"
+
+# ---------------------------------------------------------------- what ships
+
+git fetch --quiet origin "$DEPLOY_BRANCH" || die "git fetch origin $DEPLOY_BRANCH failed"
+SHA=$(git rev-parse --verify --quiet "origin/$DEPLOY_BRANCH^{commit}") || die "this repository has no origin/$DEPLOY_BRANCH"
+
+if git show-ref --verify --quiet "refs/heads/$DEPLOY_BRANCH"; then
+  ahead=$(git rev-list --count "origin/$DEPLOY_BRANCH..$DEPLOY_BRANCH")
+  [ "$ahead" -eq 0 ] ||
+    die "local $DEPLOY_BRANCH has $ahead commit(s) that are not on origin/$DEPLOY_BRANCH. deploy ships origin/$DEPLOY_BRANCH only; push them first, then run deploy again."
+fi
+
+CONFIG=$(git show "$SHA:$CONFIG_FILE" 2>/dev/null) ||
+  die "origin/$DEPLOY_BRANCH has no $CONFIG_FILE at the repository root (commit and push one; see $ROOT/README.md)"
+problems=$(jq -r -f "$ROOT/lib/validate-config.jq" <<<"$CONFIG" 2>&1) ||
+  die "$CONFIG_FILE on origin/$DEPLOY_BRANCH is not valid JSON: $problems"
+[ -z "$problems" ] || die "$CONFIG_FILE on origin/$DEPLOY_BRANCH has problems:
+$problems"
+
+cfg() { jq -r "$1" <<<"$CONFIG"; }
+NAME=$(cfg .name)
+TYPE=$(cfg .type)
+HOST=$(cfg .host)
+REMOTE_PATH=$(cfg .remote_path)
+HEALTH_URL=$(cfg .health_url)
+AUDIT_FAIL_ON=$(cfg .audit_fail_on)
+if [ "$TYPE" = node-app ]; then
+  PROC_COUNT=$(cfg '.processes | length')
+  AUDIT_DIRS=$(cfg '[.processes[].working_dir] | unique | .[]')
+else
+  require_commands rsync
+  AUDIT_DIRS=$(cfg .working_dir)
+fi
+
+# ---------------------------------------------------------------- production now
+
+if [ "$TYPE" = node-app ]; then
+  PROD=$(remote "git -C $(printf '%q' "$REMOTE_PATH") rev-parse HEAD") ||
+    die "could not read the deployed commit at $HOST:$REMOTE_PATH"
+else
+  PROD=$(remote "cat \"\$HOME/.deploy/state/$NAME.commit\" 2>/dev/null || echo unknown") ||
+    die "could not reach $HOST"
+fi
+
+# ---------------------------------------------------------------- plan
+
+describe_commit() { git log -1 --format='%h %s (%an, %ad)' --date=short "$1"; }
+
+heading "Plan: $NAME ($TYPE) on $HOST:$REMOTE_PATH"
+field "Deploying" "origin/$DEPLOY_BRANCH $(describe_commit "$SHA")"
+if [ "$PROD" = unknown ]; then
+  field "Live now" "unknown (no deploy by this tool recorded yet)"
+elif ! git cat-file -e "$PROD^{commit}" 2>/dev/null; then
+  field "Live now" "$PROD (not in this clone)"
+  say "  WARNING: the live commit is unknown here; its relation to origin/$DEPLOY_BRANCH cannot be checked."
+elif [ "$PROD" = "$SHA" ]; then
+  field "Live now" "the same commit; this is a redeploy"
+else
+  field "Live now" "$(describe_commit "$PROD")"
+  if git merge-base --is-ancestor "$PROD" "$SHA"; then
+    field "New" "$(git rev-list --count "$PROD..$SHA") commit(s):"
+    git log -n 20 --format='               %h %s' "$PROD..$SHA"
+  else
+    say "  WARNING: the live commit is not an ancestor of origin/$DEPLOY_BRANCH; deploying replaces"
+    say "           code that origin/$DEPLOY_BRANCH does not contain."
+  fi
+fi
+
+branch=$(git rev-parse --abbrev-ref HEAD)
+[ "$branch" = "$DEPLOY_BRANCH" ] || say "  Note: you are on branch '$branch'. deploy ships origin/$DEPLOY_BRANCH, not your working tree."
+[ -z "$(git status --porcelain)" ] || say "  Note: uncommitted changes in this checkout are not deployed."
+if [ -f "$CONFIG_FILE" ] && ! git diff --quiet "$SHA" -- "$CONFIG_FILE" 2>/dev/null; then
+  say "  Note: your working-tree $CONFIG_FILE differs from origin/$DEPLOY_BRANCH's; deploy uses origin/$DEPLOY_BRANCH's."
+fi
+
+if [ "$SKIP_SECURITY" = true ]; then
+  field "Checks" "SKIPPED (--skip-security)"
+else
+  field "Checks" "npm audit --omit=dev (fails on $AUDIT_FAIL_ON) in: $(paste -sd ' ' - <<<"$AUDIT_DIRS")"
+  if command -v gitleaks >/dev/null 2>&1; then
+    field "" "gitleaks secret scan of the commit's files"
+  else
+    field "" "gitleaks is NOT installed: secret scan will be skipped (brew install gitleaks)"
+  fi
+fi
+
+if [ "$TYPE" = node-app ]; then
+  say "  On $HOST, holding the lock ~/.deploy/locks/$NAME.lock, detached from this terminal:"
+  say "    git fetch + reset to ${SHA:0:12}"
+  for ((i = 0; i < PROC_COUNT; i++)); do
+    p=".processes[$i]"
+    migrate=$(cfg "$p.prisma_schema_dir // empty | \", prisma migrate deploy in \" + .")
+    say "    $(cfg "$p.pm2_name"): npm ci in $(cfg "$p.working_dir")$migrate, build: $(cfg "$p.build_cmd")"
+  done
+  say "    pm2 restart $(cfg '[.processes[].pm2_name] | join(", ")') --update-env; pm2 save"
+  say "    health: $HEALTH_URL answers 2xx/3xx, every process online with its port"
+  say "            ($(cfg '[.processes[] | "\(.pm2_name) :\(.port)"] | join(", ")')) open; 6 tries, 5s apart"
+  say "    on any failure after the reset: reset to the previous commit, npm ci, build, restart"
+else
+  say "  On this Mac: npm ci + $(cfg .build_cmd) in a clean export of ${SHA:0:12} ($(cfg .working_dir)), upload $(cfg .dist_dir)/"
+  say "  On $HOST, holding the lock ~/.deploy/locks/$NAME.lock:"
+  say "    keep a copy of the live files, publish the new ones (rsync --delete)"
+  say "    health: $HEALTH_URL answers 2xx/3xx; 6 tries, 5s apart"
+  say "    on failure: restore the previous files"
+fi
+
+if [ "$DRY_RUN" = true ]; then
+  heading "Dry run: nothing was changed."
+  exit "$EXIT_OK"
+fi
+
+# ---------------------------------------------------------------- local work
+
+WORK=$(mktemp -d "${TMPDIR:-/tmp}/deploy-$NAME.XXXXXX")
+trap 'rm -rf "$WORK"' EXIT
+EXPORT="$WORK/src"
+mkdir -p "$EXPORT"
+git archive "$SHA" | tar -x -C "$EXPORT"
+
+if [ "$SKIP_SECURITY" = true ]; then
+  heading "Security checks SKIPPED (--skip-security)"
+else
+  heading "Security checks"
+  while IFS= read -r dir; do
+    say "npm audit --omit=dev in $dir"
+    if [ "$AUDIT_FAIL_ON" = never ]; then
+      (cd "$EXPORT/$dir" && npm audit --omit=dev) || say "npm audit found issues (audit_fail_on is \"never\", so not blocking)"
+    else
+      (cd "$EXPORT/$dir" && npm audit --omit=dev --audit-level="$AUDIT_FAIL_ON") ||
+        die "npm audit found $AUDIT_FAIL_ON-or-worse issues in $dir; nothing was deployed"
+    fi
+  done <<<"$AUDIT_DIRS"
+  if command -v gitleaks >/dev/null 2>&1; then
+    say "gitleaks"
+    gitleaks detect --no-banner --redact --exit-code 1 --no-git --source "$EXPORT" --log-level warn ||
+      die "gitleaks found committed secrets; nothing was deployed"
+  else
+    say "gitleaks is NOT installed: secret scan SKIPPED (brew install gitleaks)"
+  fi
+fi
+
+RUN_ID="$(date -u +%Y%m%dT%H%M%SZ)-$NAME-${SHA:0:7}-$$"
+RUN_DIR_REMOTE=".deploy/runs/$RUN_ID" # relative to the remote home
+
+if [ "$TYPE" = static-site ]; then
+  working_dir=$(cfg .working_dir)
+  dist="$EXPORT/$working_dir/$(cfg .dist_dir)"
+  heading "Build ($working_dir)"
+  (cd "$EXPORT/$working_dir" && npm ci --no-audit --no-fund && bash -eo pipefail -c "$(cfg .build_cmd)") ||
+    die "the build failed; nothing was deployed"
+  [ -n "$(ls -A "$dist" 2>/dev/null)" ] || die "the build left no files in $working_dir/$(cfg .dist_dir); nothing was deployed"
+  heading "Upload to $HOST"
+  remote "mkdir -p $RUN_DIR_REMOTE" || die "could not create the run directory on $HOST"
+  rsync -az --delete -e "ssh ${SSH_OPTS[*]}" "$dist/" "$HOST:$RUN_DIR_REMOTE/dist/" ||
+    die "the upload failed; nothing was deployed"
+fi
+
+# ---------------------------------------------------------------- remote job
+
+# The job script: parameters, then the shared and per-type remote code.
+compose_job() {
+  local i p
+  printf '#!/usr/bin/env bash\n'
+  printf '# deploy job %s, generated by %s\n' "$RUN_ID" "$ROOT/bin/deploy"
+  printf 'set -uo pipefail\n'
+  printf 'DEPLOY_HOME="$HOME/.deploy"\n'
+  printf 'RUN_ID=%q\n' "$RUN_ID"
+  printf 'RUN_DIR="$DEPLOY_HOME/runs/$RUN_ID"\n'
+  printf 'NAME=%q\n' "$NAME"
+  printf 'SHA=%q\n' "$SHA"
+  printf 'EXPECTED_PREV=%q\n' "$PROD"
+  printf 'REMOTE_PATH=%q\n' "$REMOTE_PATH"
+  printf 'HEALTH_URL=%q\n' "$HEALTH_URL"
+  printf 'DEPLOYED_BY=%q\n' "$(id -un)@$(hostname -s) ($REPO)"
+  if [ "$TYPE" = node-app ]; then
+    printf 'PROC_NAMES=() PROC_PORTS=() PROC_DIRS=() PROC_BUILDS=() PROC_PRISMA=()\n'
+    for ((i = 0; i < PROC_COUNT; i++)); do
+      p=".processes[$i]"
+      printf 'PROC_NAMES+=(%q)\n' "$(cfg "$p.pm2_name")"
+      printf 'PROC_PORTS+=(%q)\n' "$(cfg "$p.port")"
+      printf 'PROC_DIRS+=(%q)\n' "$(cfg "$p.working_dir")"
+      printf 'PROC_BUILDS+=(%q)\n' "$(cfg "$p.build_cmd")"
+      printf 'PROC_PRISMA+=(%q)\n' "$(cfg "$p.prisma_schema_dir // \"\"")"
+    done
+  fi
+  cat "$ROOT/lib/remote/common.sh" "$ROOT/lib/remote/$TYPE.sh"
+  printf '\njob_entry "$@"\n'
+}
+
+# Runs on the VPS: store the job, start it in its own session (it survives
+# the SSH connection), stream its log until it ends, exit with its code.
+LAUNCHER="set -eu
+run_dir=\$HOME/$RUN_DIR_REMOTE
+mkdir -p \"\$run_dir\"
+cat >\"\$run_dir/job.sh\"
+: >\"\$run_dir/log\"
+setsid nohup bash \"\$run_dir/job.sh\" >\"\$run_dir/log\" 2>&1 </dev/null &
+tail -n +1 -F --pid=\$! \"\$run_dir/log\" 2>/dev/null
+exit \"\$(cat \"\$run_dir/exit-code\" 2>/dev/null || echo $EXIT_UNKNOWN)\""
+
+detached() {
+  printf '\n'
+  say "Detached. The deploy keeps running on $HOST. Follow it with:"
+  say "  ssh $HOST 'tail -n +1 -f ~/$RUN_DIR_REMOTE/log'"
+  say "Its exit code lands in ~/$RUN_DIR_REMOTE/exit-code (codes: deploy --help)."
+}
+
+heading "Deploying on $HOST (run $RUN_ID)"
+say "Ctrl-C detaches this terminal; the deploy itself keeps running on $HOST."
+trap 'detached; exit $EXIT_DISCONNECTED' INT
+
+compose_job >"$WORK/job.sh"
+set +e
+remote "$LAUNCHER" <"$WORK/job.sh"
+rc=$?
+set -e
+trap - INT
+
+printf '\n'
+case $rc in
+  "$EXIT_OK") say "deploy: $NAME is live on ${SHA:0:12}." ;;
+  "$EXIT_REFUSED") say "deploy: refused on $HOST; production was not changed (reason above)." ;;
+  "$EXIT_LOCKED") say "deploy: another deploy of $NAME is running; production was not changed by this run. Try again once it ends." ;;
+  "$EXIT_ROLLED_BACK") say "deploy: FAILED and rolled back. $NAME is healthy on the previous version; ${SHA:0:12} is not live." ;;
+  "$EXIT_ROLLBACK_FAILED") say "deploy: FAILED and the ROLLBACK FAILED. $NAME may be down. Act now: ssh $HOST, pm2 status, read the log above." ;;
+  255) detached; say "(The SSH connection to $HOST was lost.)"; rc=$EXIT_DISCONNECTED ;;
+  *) say "deploy: the remote job ended unexpectedly (exit $rc). Read ~/$RUN_DIR_REMOTE/log on $HOST."; rc=$EXIT_UNKNOWN ;;
+esac
+exit "$rc"
