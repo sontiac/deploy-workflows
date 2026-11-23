@@ -555,7 +555,7 @@ EOF
   reset_pm2_calls
   expect_deploy "offline, second migration fails: restored, rolled back" 20
   expect_log "second migration fails: the restore ran" "RESTORED: the database is back to what it was"
-  expect_log "second migration fails: the restore was verified" "verified: the schema fingerprint and the row counts"
+  expect_log "second migration fails: the restore was verified" "verified: the schema fingerprint, the row counts of every table and every sequence position"
   expect_equal "second migration fails: database identical (schema, every table's contents, _prisma_migrations)" "$(snapshot)" "$before"
   expect_equal "second migration fails: the Note sequence is back where it was ($sequence_before)" \
     "$(offsql <<<"select last_value from pg_sequences where sequencename = 'Note_id_seq'")" "$sequence_before"
@@ -669,15 +669,15 @@ EOF
   write_schema 'url       = env("DATABASE_URL")' 'directUrl = env("DIRECT_URL")'
   commit_and_push "O7a: directUrl"
   refusal "a directUrl in the Prisma schema" "has a directUrl"
-  git revert -q --no-edit HEAD && git push -q origin main
+  git revert --no-edit HEAD >/dev/null && git push -q origin main
   write_schema 'url      = env("OTHER_URL")'
   commit_and_push "O7b: another variable"
   refusal "a datasource url from another variable" 'is not env("DATABASE_URL")'
-  git revert -q --no-edit HEAD && git push -q origin main
+  git revert --no-edit HEAD >/dev/null && git push -q origin main
   echo "export default {}" >prisma.config.ts
   commit_and_push "O7c: prisma.config"
   refusal "a prisma.config file" "a prisma.config file exists"
-  git revert -q --no-edit HEAD && git push -q origin main
+  git revert --no-edit HEAD >/dev/null && git push -q origin main
   untouched "a Prisma schema that differs"
 
   # ----- retention: the newest five dumps are kept
