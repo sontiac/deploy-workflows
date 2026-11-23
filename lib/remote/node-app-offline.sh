@@ -184,6 +184,8 @@ offline_preflight() {
   fi
   log "ok: the database answers (server version $server_version_num); pg_dump $version"
 
+  value=$(sql "select count(*) from pg_namespace where nspname = 'public'") || { log "PREFLIGHT: could not look for the schema public"; return 1; }
+  [ "$value" = 1 ] || { log "PREFLIGHT: the database has no schema public"; return 1; }
   value=$(sql "select coalesce(string_agg(nspname, ', ' order by nspname), '') from pg_namespace where nspname not in ('public', 'information_schema') and nspname !~ '^pg_'") ||
     { log "PREFLIGHT: could not list the schemas"; return 1; }
   [ -z "$value" ] || { log "PREFLIGHT: the database has schemas besides public ($value); offline migrations support one schema"; return 1; }
@@ -199,7 +201,12 @@ offline_preflight() {
   [ "$value" = 1 ] || { log "PREFLIGHT: $DB_USER does not own the database $DB_NAME"; return 1; }
   value=$(sql "$FOREIGN_OWNER_QUERY") || { log "PREFLIGHT: could not read the owners of the objects in public"; return 1; }
   [ -z "$value" ] || { log "PREFLIGHT: objects in public owned by another role than $DB_USER: $value"; return 1; }
-  log "ok: $DB_USER owns the database and every object in public"
+  # DROP OWNED also revokes what was granted to the role on shared objects (databases, tablespaces),
+  # and no dump of this database could put that back.
+  value=$(sql "select count(*) from pg_shdepend where dbid = 0 and deptype = 'a' and refclassid = 'pg_authid'::regclass and refobjid = (select oid from pg_roles where rolname = current_user)") ||
+    { log "PREFLIGHT: could not read the privileges granted to $DB_USER"; return 1; }
+  [ "$value" = 0 ] || { log "PREFLIGHT: $DB_USER was granted privileges on $value database(s) or tablespace(s); the restore would revoke them"; return 1; }
+  log "ok: $DB_USER owns the database and every object in public, and holds no grant on a shared object"
 
   value=$(sql "select to_regclass('public._prisma_migrations') is not null") || { log "PREFLIGHT: could not look for _prisma_migrations"; return 1; }
   if [ "$value" = t ]; then

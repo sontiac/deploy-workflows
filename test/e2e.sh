@@ -29,7 +29,7 @@
 #   - preflight refusals, each exit 10 with nothing changed: an extra schema,
 #     a missing pg_dump, an object another role owns, a failed migration
 #     already recorded, a DATABASE_URL parameter the tools cannot honour, a
-#     large object
+#     schema other than public in it, a grant on a shared object, a large object
 #   - the password appears neither in the run logs and job scripts nor in the
 #     process list during the three pauses, and never reaches the app's environment
 #   - retention keeps the newest five dumps
@@ -72,7 +72,8 @@ fail() { printf 'FAIL  %s\n' "$1"; FAILURES=$((FAILURES + 1)); }
 expect_deploy() {
   local description=$1 expected=$2 rc=0
   shift 2
-  "$DEPLOY" "$@" >"$WORK/last.log" 2>&1 || rc=$?
+  # DEPLOY_VIA=/bin/bash runs the command under macOS's bash 3.2.
+  "${DEPLOY_VIA:-$DEPLOY}" ${DEPLOY_VIA:+"$DEPLOY"} "$@" >"$WORK/last.log" 2>&1 || rc=$?
   cat "$WORK/last.log" >>"$WORK/all.log"
   if [ "$rc" -eq "$expected" ]; then pass "$description (exit $rc)"; else
     fail "$description: expected exit $expected, got $rc"
@@ -460,6 +461,9 @@ EOF
   runs_before=$(on_box 'ls ~/.deploy/runs 2>/dev/null | wc -l' | tr -d ' ')
   reset_pm2_calls
   expect_deploy "offline dry run" 0 --dry-run
+  cp "$WORK/last.log" "$WORK/plan.txt"
+  DEPLOY_VIA=/bin/bash expect_deploy "offline dry run under /bin/bash ($(/bin/bash -c 'echo $BASH_VERSION'))" 0 --dry-run
+  expect_equal "offline dry run: the same plan under /bin/bash" "$(cat "$WORK/last.log")" "$(cat "$WORK/plan.txt")"
   expect_log "offline dry run: prints the offline plan" "Migrations are OFFLINE"
   expect_log "offline dry run: names the pause" "pm2 stop every process; dump the database"
   expect_equal "offline dry run: starts no job" "$(on_box 'ls ~/.deploy/runs 2>/dev/null | wc -l' | tr -d ' ')" "$runs_before"
@@ -491,7 +495,7 @@ EOF
   O3=$(git rev-parse HEAD)
   docker exec -d -w /root "$CONTAINER" pssample
   reset_pm2_calls
-  expect_deploy "offline, pending migrations succeed" 0
+  DEPLOY_VIA=/bin/bash expect_deploy "offline, pending migrations succeed (run by /bin/bash $(/bin/bash -c 'echo $BASH_VERSION'))" 0
   expect_log "pending: preflight passed" "preflight passed"
   expect_log "pending: said it paused" "migrations are pending: pausing e2e-offline"
   expect_equal "pending: live commit" "$(live_off)" "$O3"
@@ -626,6 +630,11 @@ EOF
   refusal "a schema other than public in DATABASE_URL" "only the public schema is supported"
   on_box 'cp /root/env.good /srv/offapp/.env'
   untouched "a bad DATABASE_URL"
+
+  on_box "su postgres -c 'psql -X -q -c \"GRANT CONNECT ON DATABASE postgres TO appuser\"'"
+  refusal "a privilege on a shared object" "was granted privileges on 1 database(s)"
+  on_box "su postgres -c 'psql -X -q -c \"REVOKE CONNECT ON DATABASE postgres FROM appuser\"'"
+  untouched "a privilege on a shared object"
 
   offsql <<<"select lo_create(424242)" >/dev/null
   refusal "a large object" "1 large object(s)"
