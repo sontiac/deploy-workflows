@@ -6,6 +6,8 @@
 #
 # Extra parameters from the generated header (parallel arrays, one entry per process):
 #   PROC_NAMES PROC_PORTS PROC_DIRS PROC_BUILDS PROC_PRISMA (empty: no prisma)
+# Only for an app with an offline-migrations process, together with node-app-offline.sh:
+#   OFFLINE_SCHEMA_DIR
 
 # install_and_build migrate|no-migrate
 install_and_build() {
@@ -107,6 +109,12 @@ job_main() {
 
   section "git fetch ${SHA:0:12}"
   git -C "$REMOTE_PATH" fetch --depth=1 origin "$SHA" || { refuse "could not fetch ${SHA:0:12} from origin"; return; }
+
+  # Offline migrations (node-app-offline.sh, appended by bin/deploy for such apps only) change the order of the release.
+  if [ -n "${OFFLINE_SCHEMA_DIR:-}" ]; then
+    offline_release "$prev"
+    return
+  fi
 
   # From here on production changes, so every failure ends in a rollback.
   if release; then
