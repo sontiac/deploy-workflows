@@ -117,9 +117,12 @@ HOST=$(cfg .host)
 REMOTE_PATH=$(cfg .remote_path)
 HEALTH_URL=$(cfg .health_url)
 AUDIT_FAIL_ON=$(cfg .audit_fail_on)
+OFFLINE_SCHEMA_DIR=""
 if [ "$TYPE" = node-app ]; then
   PROC_COUNT=$(cfg '.processes | length')
   AUDIT_DIRS=$(cfg '[.processes[].working_dir] | unique | .[]')
+  # validate-config.jq guarantees that an app with an offline process has exactly one prisma_schema_dir.
+  OFFLINE_SCHEMA_DIR=$(cfg '[.processes[] | select(.migrations == "offline") | .prisma_schema_dir] | first // ""')
 else
   require_commands rsync
   AUDIT_DIRS=$(cfg .working_dir)
@@ -177,7 +180,28 @@ else
   fi
 fi
 
-if [ "$TYPE" = node-app ]; then
+if [ "$TYPE" = node-app ] && [ -n "$OFFLINE_SCHEMA_DIR" ]; then
+  say "  On $HOST, holding the lock ~/.deploy/locks/$NAME.lock, detached from this terminal."
+  say "  Migrations are OFFLINE: they run in a short pause, with a database backup you can roll back to."
+  say "    1. preflight; refuses, changing nothing, unless the backup can be restored without a superuser:"
+  say "       pg_dump, pg_restore, psql present; DATABASE_URL from $OFFLINE_SCHEMA_DIR/.env answers; schema public only,"
+  say "       no extension, every object owned by the connecting role; free space >= 3x the database; a trial dump lists"
+  say "    2. git fetch + reset to ${SHA:0:12}; per process, with the old version still serving and no migration run:"
+  for ((i = 0; i < PROC_COUNT; i++)); do
+    p=".processes[$i]"
+    say "       $(cfg "$p.pm2_name"): npm ci in $(cfg "$p.working_dir"), build: $(cfg "$p.build_cmd")"
+  done
+  say "       a failed step here resets to the previous commit; the database was never touched"
+  say "    3. prisma migrate status in $OFFLINE_SCHEMA_DIR. Nothing pending: pm2 restart $(cfg '[.processes[].pm2_name] | join(", ")') --update-env, no pause, no backup"
+  say "       Pending: the pause. pm2 stop every process; dump the database to ~/.deploy/backups/$NAME/<run>.dump"
+  say "       (the newest 5 are kept) with its schema fingerprint and row counts; prisma migrate deploy in $OFFLINE_SCHEMA_DIR;"
+  say "       pm2 start every process; pm2 save"
+  say "    4. health: $HEALTH_URL answers 2xx/3xx, every process online with its port"
+  say "       ($(cfg '[.processes[] | "\(.pm2_name) :\(.port)"] | join(", ")')) open; 6 tries, 5s apart"
+  say "    5. on any failure after the backup: stop the processes, restore the dump in one transaction, check the"
+  say "       restored schema and row counts equal the dump's, then reset to the previous commit, npm ci, build, restart."
+  say "       If the restore fails, nothing is started and the log prints the one command that finishes the job (job.sh --recover, exit 30)."
+elif [ "$TYPE" = node-app ]; then
   say "  On $HOST, holding the lock ~/.deploy/locks/$NAME.lock, detached from this terminal:"
   say "    git fetch + reset to ${SHA:0:12}"
   for ((i = 0; i < PROC_COUNT; i++)); do
@@ -275,9 +299,12 @@ compose_job() {
       printf 'PROC_BUILDS+=(%q)\n' "$(cfg "$p.build_cmd")"
       printf 'PROC_PRISMA+=(%q)\n' "$(cfg "$p.prisma_schema_dir // \"\"")"
     done
+    # Always defined, empty unless the app opted in, so nothing inherited from the remote environment can turn it on.
+    printf 'OFFLINE_SCHEMA_DIR=%q\n' "$OFFLINE_SCHEMA_DIR"
   fi
   cat "$ROOT/lib/remote/common.sh" "$ROOT/lib/remote/$TYPE.sh"
-  printf '\njob_entry "$@"\n'
+  [ -z "$OFFLINE_SCHEMA_DIR" ] || cat "$ROOT/lib/remote/node-app-offline.sh"
+  if [ -n "$OFFLINE_SCHEMA_DIR" ]; then printf '\noffline_entry "$@"\n'; else printf '\njob_entry "$@"\n'; fi
 }
 
 # Runs on the VPS: store the job, start it in its own session (it survives
@@ -315,7 +342,9 @@ case $rc in
   "$EXIT_REFUSED") say "deploy: refused on $HOST; production was not changed (reason above)." ;;
   "$EXIT_LOCKED") say "deploy: another deploy of $NAME is running; production was not changed by this run. Try again once it ends." ;;
   "$EXIT_ROLLED_BACK") say "deploy: FAILED and rolled back. $NAME is healthy on the previous version; ${SHA:0:12} is not live." ;;
-  "$EXIT_ROLLBACK_FAILED") say "deploy: FAILED and the ROLLBACK FAILED. $NAME may be down. Act now: ssh $HOST, pm2 status, read the log above." ;;
+  "$EXIT_ROLLBACK_FAILED")
+    say "deploy: FAILED and the ROLLBACK FAILED. $NAME may be down. Act now: ssh $HOST, pm2 status, read the log above."
+    [ -z "$OFFLINE_SCHEMA_DIR" ] || say "         (If the database restore failed, nothing was started on purpose; the log has the backup path and the one command that finishes the job: bash ~/$RUN_DIR_REMOTE/job.sh --recover on $HOST.)" ;;
   255) detached; say "(The SSH connection to $HOST was lost.)"; rc=$EXIT_DISCONNECTED ;;
   *) say "deploy: the remote job ended unexpectedly (exit $rc). Read ~/$RUN_DIR_REMOTE/log on $HOST."; rc=$EXIT_UNKNOWN ;;
 esac
