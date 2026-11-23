@@ -235,11 +235,14 @@ retried. `history.tsv` records the run as `restore-failed`.
 - A release that changes the owner, privileges or comment of schema `public`
   itself is not undone by the restore; the verification notices and the run
   ends in exit 30.
-- Rows written between the dump and a failed release are not possible (the app is
-  stopped), but anything that writes to the database from elsewhere in that window is lost
-  by the restore.
-- The pm2 processes are stopped and started with `pm2 stop` and `pm2 restart`;
-  `pm2 save` runs after the start, not after the stop.
+- The app is stopped from the dump to the end of the release, so it writes
+  nothing in between. Anything else that writes to the database in that window
+  (a script, an admin tool) is lost by a restore.
+- The role the app connects as must not hold grants on other databases or
+  tablespaces: `DROP OWNED` would revoke them and no dump of this database can
+  put them back. The preflight refuses.
+- `pm2 restart` of a stopped process starts it (checked against pm2 7), so the
+  start after the pause is the same call as the normal restart.
 
 ## Layout
 
