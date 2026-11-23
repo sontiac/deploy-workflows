@@ -28,7 +28,7 @@ FINGERPRINT_RESTRICT_KEY=deploy
 # Connection settings, filled in by load_database_url.
 DB_URL="" DB_HOST="" DB_PORT="" DB_USER="" DB_PASSWORD="" DB_NAME="" DB_SSLMODE=""
 # What the database looked like when it was dumped, filled in by dump_database.
-DB_FINGERPRINT="" DB_ROW_COUNTS=""
+DB_FINGERPRINT="" DB_ROW_COUNTS="" DB_SEQUENCES=""
 
 # Reads DATABASE_URL from the .env in the schema directory, the way prisma
 # does, and prints it as NUL-terminated fields: url, host, port, user,
@@ -133,6 +133,10 @@ table_row_counts() {
   sql "select tablename || '=' || (xpath('/row/c/text()', query_to_xml(format('select count(*) as c from %I.%I', schemaname, tablename), false, true, '')))[1]::text from pg_tables where schemaname = 'public' order by tablename"
 }
 
+sequence_positions() {
+  sql "select schemaname || '.' || sequencename || '=' || coalesce(last_value::text, 'unused') from pg_sequences where schemaname = 'public' order by 1"
+}
+
 # Objects in schema public that the connecting role does not own. The
 # restore drops what the role owns and recreates it from the dump; anything
 # else could not be dropped, or recreated with the same owner.
@@ -156,6 +160,72 @@ select coalesce(string_agg(kind || ' ' || name, ', ' order by kind, name), '') f
 SQL
 )
 
+# Reads a Prisma schema on stdin; refuses (exit 2, reason on stderr) unless its one datasource
+# is `url = env("DATABASE_URL")` with no directUrl. Prisma migrates through directUrl when there
+# is one, and through whatever variable `url` names, so the backup (built from DATABASE_URL)
+# would otherwise be of another database than the one the migrations change.
+read -r -d '' PRISMA_DATASOURCE_CHECK <<'JS'
+const text = require("fs").readFileSync(0, "utf8").replace(/\/\/.*$/gm, "");
+const refuse = (message) => {
+  console.error(message);
+  process.exit(2);
+};
+const blocks = [...text.matchAll(/^[ \t]*datasource[ \t]+\w+[ \t]*\{([^}]*)\}/gm)];
+if (blocks.length !== 1) refuse(`the schema declares ${blocks.length} datasources; exactly one is supported`);
+const body = blocks[0][1];
+if (/^[ \t]*directUrl[ \t]*=/m.test(body)) refuse("the datasource has a directUrl, through which prisma migrates instead of DATABASE_URL");
+if (!/^[ \t]*url[ \t]*=[ \t]*env\(\s*"DATABASE_URL"\s*\)[ \t]*$/m.test(body)) {
+  refuse('the datasource url is not env("DATABASE_URL"), the variable the backup is built from');
+}
+JS
+
+# The schema location configured in package.json ("prisma": { "schema": ... }), if any.
+read -r -d '' PRISMA_SCHEMA_SETTING <<'JS'
+let input = "";
+process.stdin.on("data", (chunk) => (input += chunk)).on("end", () => {
+  const setting = JSON.parse(input).prisma;
+  if (setting && typeof setting.schema === "string") process.stdout.write(setting.schema.replace(/^\.\//, ""));
+});
+JS
+
+# Checks the Prisma schema of the commit being deployed, the one `prisma migrate deploy` will load from
+# its default locations (or from package.json), against what the backup is built from.
+check_prisma_schema() {
+  local prefix="$OFFLINE_SCHEMA_DIR/" setting candidate path existing=0 type
+  local -a files=()
+  [ "$OFFLINE_SCHEMA_DIR" != . ] || prefix=""
+
+  if git -C "$REMOTE_PATH" ls-tree --name-only "$SHA" ${prefix:+"$prefix"} | grep -Eq '(^|/)prisma\.config\.[a-z]+$'; then
+    log "PREFLIGHT: a prisma.config file exists in $OFFLINE_SCHEMA_DIR; it can change the schema and the datasource, which this tool does not follow"
+    return 1
+  fi
+  setting=$(git -C "$REMOTE_PATH" show "$SHA:${prefix}package.json" 2>/dev/null | node -e "$PRISMA_SCHEMA_SETTING") ||
+    { log "PREFLIGHT: could not read package.json in $OFFLINE_SCHEMA_DIR"; return 1; }
+  if [ -n "$setting" ]; then
+    path="$prefix$setting"
+    existing=1
+  else
+    for candidate in "${prefix}prisma/schema.prisma" "${prefix}schema.prisma" "${prefix}prisma/schema"; do
+      if git -C "$REMOTE_PATH" cat-file -e "$SHA:$candidate" 2>/dev/null; then
+        path=$candidate
+        existing=$((existing + 1))
+      fi
+    done
+  fi
+  [ "$existing" -eq 1 ] || { log "PREFLIGHT: found $existing Prisma schema locations in $OFFLINE_SCHEMA_DIR; exactly one is needed"; return 1; }
+
+  type=$(git -C "$REMOTE_PATH" cat-file -t "$SHA:$path") || { log "PREFLIGHT: the Prisma schema $path is not in the commit"; return 1; }
+  if [ "$type" = tree ]; then
+    mapfile -t files < <(git -C "$REMOTE_PATH" ls-tree -r --name-only "$SHA" "$path/" | grep '\.prisma$')
+  else
+    files=("$path")
+  fi
+  [ "${#files[@]}" -gt 0 ] || { log "PREFLIGHT: no .prisma file under $path"; return 1; }
+  for candidate in "${files[@]}"; do git -C "$REMOTE_PATH" show "$SHA:$candidate"; done |
+    node -e "$PRISMA_DATASOURCE_CHECK" || { log "PREFLIGHT: the Prisma schema in $path cannot be backed up reliably (see above)"; return 1; }
+  log "ok: the Prisma schema ($path) uses env(\"DATABASE_URL\") and no directUrl"
+}
+
 # Everything that must hold before the first change, or the backup could not be restored. Prints what it checked.
 offline_preflight() {
   local backup_dir="$DEPLOY_HOME/backups/$NAME" trial="$DEPLOY_HOME/backups/$NAME/$RUN_ID.trial"
@@ -168,6 +238,7 @@ offline_preflight() {
   log "ok: pg_dump, pg_restore, psql and node are installed"
 
   load_database_url || { log "PREFLIGHT: DATABASE_URL could not be used (see above)"; return 1; }
+  check_prisma_schema || return 1
   log "ok: DATABASE_URL read from $OFFLINE_SCHEMA_DIR/.env ($DB_USER@$DB_HOST:$DB_PORT/$DB_NAME)"
 
   server_version_num=$(sql 'show server_version_num') ||
@@ -244,23 +315,49 @@ dump_database() {
   local file=$1 size
   DB_FINGERPRINT=$(schema_fingerprint) || { log "could not take the schema fingerprint"; return 1; }
   DB_ROW_COUNTS=$(table_row_counts) || { log "could not count the rows"; return 1; }
+  DB_SEQUENCES=$(sequence_positions) || { log "could not read the sequence positions"; return 1; }
   (umask 077 && db_tool pg_dump -w -Fc -f "$file") || { log "pg_dump failed"; return 1; }
   pg_restore -l "$file" >/dev/null || { log "the dump cannot be listed by pg_restore"; return 1; }
   size=$(stat -c %s "$file") || return 1
-  log "backup: $file ($size bytes); schema fingerprint ${DB_FINGERPRINT:0:16}; $(wc -l <<<"$DB_ROW_COUNTS") tables counted"
+  log "backup: $file ($size bytes); schema fingerprint ${DB_FINGERPRINT:0:16}; $(wc -l <<<"$DB_ROW_COUNTS") tables and $(wc -l <<<"$DB_SEQUENCES") sequences recorded"
 }
 
-# Keeps the newest BACKUP_KEEP dumps of this app. Run ids start with a UTC
-# timestamp, so their names sort in time order.
+# What a recovery (job.sh --recover) needs, kept in the run directory. No password.
+save_recovery_state() {
+  local prev=$1 dump=$2 dir="$RUN_DIR/recovery"
+  (
+    umask 077
+    mkdir -p "$dir" &&
+      printf '%s\n' "$dump" >"$dir/dump" &&
+      printf '%s\n' "$prev" >"$dir/prev" &&
+      printf '%s\n' "$DB_FINGERPRINT" >"$dir/fingerprint" &&
+      printf '%s\n' "$DB_ROW_COUNTS" >"$dir/row-counts" &&
+      printf '%s\n' "$DB_SEQUENCES" >"$dir/sequences"
+  ) || { log "could not save the recovery state in $dir"; return 1; }
+}
+
+# Sets REC_DUMP REC_PREV and the recorded database state from a run's recovery state.
+load_recovery_state() {
+  local dir="$RUN_DIR/recovery"
+  [ -f "$dir/dump" ] || return 1
+  REC_DUMP=$(<"$dir/dump") && REC_PREV=$(<"$dir/prev") && DB_FINGERPRINT=$(<"$dir/fingerprint") &&
+    DB_ROW_COUNTS=$(<"$dir/row-counts") && DB_SEQUENCES=$(<"$dir/sequences")
+}
+
+# Keeps the BACKUP_KEEP newest dumps of this app, the current one always among
+# them. "Newest" is this host's modification time: a run id carries the
+# deploying Mac's clock, which may be wrong. A failed removal is only a warning.
 prune_dumps() {
-  local backup_dir="$DEPLOY_HOME/backups/$NAME" name
-  local -a names
-  mapfile -t names < <(find "$backup_dir" -maxdepth 1 -type f -name '*.dump' -printf '%f\n' | sort)
-  if [ "${#names[@]}" -gt "$BACKUP_KEEP" ]; then
-    for name in "${names[@]:0:${#names[@]}-BACKUP_KEEP}"; do
-      rm -f -- "$backup_dir/$name" && log "removed the old backup $name (the newest $BACKUP_KEEP are kept)"
-    done
-  fi
+  local current=$1 backup_dir="$DEPLOY_HOME/backups/$NAME" name
+  local -a others
+  mapfile -t others < <(find "$backup_dir" -maxdepth 1 -type f -name '*.dump' ! -name "$current" -printf '%T@ %f\n' | sort -rn | cut -d' ' -f2-)
+  for name in "${others[@]:BACKUP_KEEP-1}"; do
+    if rm -f -- "$backup_dir/$name"; then
+      log "removed the old backup $name (the newest $BACKUP_KEEP are kept)"
+    else
+      log "WARNING: could not remove the old backup $backup_dir/$name"
+    fi
+  done
 }
 
 # Puts the database back to the dump in ONE transaction: drops everything the
@@ -268,19 +365,23 @@ prune_dumps() {
 # dump. COMMIT is only sent when pg_restore read the whole dump, so a
 # truncated or unreadable dump rolls back and leaves the database as it was.
 restore_database() {
-  local file=$1
+  local file=$1 producer consumer
   {
     printf "BEGIN;\nSET LOCAL lock_timeout = '%s';\nDROP OWNED BY CURRENT_USER;\n" "$RESTORE_LOCK_TIMEOUT"
     pg_restore -f - "$file" || exit 1
     printf 'COMMIT;\n'
   } | db_tool psql -X -w -q -o /dev/null -v ON_ERROR_STOP=1 -f -
+  producer=${PIPESTATUS[0]} consumer=${PIPESTATUS[1]}
+  [ "$producer" -eq 0 ] || { log "pg_restore could not read the dump $file; nothing was committed"; return 1; }
+  [ "$consumer" -eq 0 ] || { log "psql failed while restoring; nothing was committed"; return 1; }
 }
 
 # The restored database must be the one that was dumped.
 verify_restore() {
-  local fingerprint counts
+  local fingerprint counts sequences
   fingerprint=$(schema_fingerprint) || { log "could not take the schema fingerprint after the restore"; return 1; }
   counts=$(table_row_counts) || { log "could not count the rows after the restore"; return 1; }
+  sequences=$(sequence_positions) || { log "could not read the sequence positions after the restore"; return 1; }
   if [ "$fingerprint" != "$DB_FINGERPRINT" ]; then
     log "the restored schema (${fingerprint:0:16}) differs from the one that was dumped (${DB_FINGERPRINT:0:16})"
     return 1
@@ -290,7 +391,12 @@ verify_restore() {
     diff <(printf '%s\n' "$DB_ROW_COUNTS") <(printf '%s\n' "$counts") | sed 's/^/    /'
     return 1
   fi
-  log "verified: the schema fingerprint and the row counts of every table equal the dump's"
+  if [ "$sequences" != "$DB_SEQUENCES" ]; then
+    log "the restored sequence positions differ from the dumped ones (expected < > restored):"
+    diff <(printf '%s\n' "$DB_SEQUENCES") <(printf '%s\n' "$sequences") | sed 's/^/    /'
+    return 1
+  fi
+  log "verified: the schema fingerprint, the row counts of every table and every sequence position equal the dump's"
 }
 
 stop_processes() {
@@ -312,21 +418,18 @@ migrations_pending() {
   [ $? -ne 0 ]
 }
 
-print_manual_recovery() {
-  local prev=$1 dump=$2 i
-  log "The database could not be put back automatically. $NAME is STOPPED on purpose: the old code must"
-  log "not run on a database in an unknown state. The backup taken before the migrations is:"
-  log "    $dump"
-  log "To finish by hand (the password is DATABASE_URL's in $REMOTE_PATH/$OFFLINE_SCHEMA_DIR/.env):"
-  log "  1. restore the database in one transaction:"
-  log "       export PGHOST=$DB_HOST PGPORT=$DB_PORT PGUSER=$DB_USER PGDATABASE=$DB_NAME; read -rs -p 'database password: ' PGPASSWORD; export PGPASSWORD"
-  log "       { echo \"BEGIN; SET LOCAL lock_timeout = '$RESTORE_LOCK_TIMEOUT'; DROP OWNED BY CURRENT_USER;\"; pg_restore -f - '$dump' && echo 'COMMIT;'; } | psql -X -q -o /dev/null -v ON_ERROR_STOP=1 -f -"
-  log "  2. put the previous code back and start it:"
-  log "       git -C $REMOTE_PATH reset --hard $prev"
+# After a failed restore: the true state of every process, and the one command that finishes the job.
+report_recovery() {
+  local dump=$1 i
+  log "The database could not be put back. Nothing was started: the old code must not run on a database in an unknown state."
+  log "State of the processes now, as pm2 reports it:"
   for i in "${!PROC_NAMES[@]}"; do
-    log "       (cd $REMOTE_PATH/${PROC_DIRS[$i]} && npm ci && ${PROC_BUILDS[$i]} && pm2 restart ${PROC_NAMES[$i]} --update-env)"
+    log "    ${PROC_NAMES[$i]}: $(pm2_status "${PROC_NAMES[$i]}")"
   done
-  log "       pm2 save"
+  log "The backup taken before the migrations: $dump"
+  log "To finish (it takes the app's lock, then does the same stop, restore, verification, code rollback and"
+  log "health check as this job, with the same exit codes; run it again after fixing what failed):"
+  log "    bash $RUN_DIR/job.sh --recover"
 }
 
 # A failure after the dump: stop everything, restore, verify, then the usual code rollback.
@@ -337,7 +440,7 @@ offline_restore_and_rollback() {
     log "RESTORED: the database is back to what it was before the migrations."
   else
     log "RESTORE FAILED: the database may not be in the state it was dumped in."
-    print_manual_recovery "$prev" "$dump"
+    report_recovery "$dump"
     record_history restore-failed
     return "$EXIT_ROLLBACK_FAILED"
   fi
@@ -369,7 +472,12 @@ offline_window() {
     rollback "$prev"
     return
   fi
-  prune_dumps
+  if ! save_recovery_state "$prev" "$dump"; then
+    log "FAILED: the recovery state could not be saved. The database was not touched."
+    rollback "$prev"
+    return
+  fi
+  prune_dumps "$(basename "$dump")"
 
   # From here the database changes, so every failure restores the backup.
   section "prisma migrate deploy (in $OFFLINE_SCHEMA_DIR)"
@@ -415,4 +523,41 @@ offline_release() {
     log "FAILED: the restart failed (see above)."
   fi
   rollback "$prev"
+}
+
+# job.sh --recover: finishes a release whose restore failed. The same sequence
+# as a failure in the pause, from the state saved when the dump was taken.
+job_recover() {
+  local head
+  section "RECOVER run $RUN_ID: restore the backup, then put the previous code back"
+  load_recovery_state || { refuse "run $RUN_ID took no backup, so there is nothing to recover"; return; }
+  head=$(git -C "$REMOTE_PATH" rev-parse HEAD) || { refuse "$REMOTE_PATH is not a git checkout"; return; }
+  if [ "$head" != "$SHA" ] && [ "$head" != "$REC_PREV" ]; then
+    refuse "production is at ${head:0:12}, not on run $RUN_ID's ${SHA:0:12} or ${REC_PREV:0:12}; a later deploy happened, so this backup is out of date"
+    return
+  fi
+  load_database_url || { refuse "DATABASE_URL could not be used (see above)"; return; }
+  offline_restore_and_rollback "$REC_PREV" "$REC_DUMP"
+}
+
+# Entry point of an offline app's job: the normal one, plus --recover.
+offline_entry() {
+  local rc
+  case ${1:-} in
+    --recover)
+      mkdir -p "$DEPLOY_HOME/locks"
+      flock -n -o -E "$EXIT_LOCKED" "$DEPLOY_HOME/locks/$NAME.lock" bash "$RUN_DIR/job.sh" --recover-locked
+      rc=$?
+      if [ "$rc" -eq "$EXIT_LOCKED" ]; then
+        log "REFUSED: another deploy of $NAME is running; nothing was changed."
+      fi
+      printf '%s\n' "$rc" >"$RUN_DIR/recover-exit-code"
+      exit "$rc" ;;
+    --recover-locked)
+      printf 'run:   %s (recover)\nby:    %s\nsince: %s\n' "$RUN_ID" "$DEPLOYED_BY" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+        >"$DEPLOY_HOME/locks/$NAME.holder"
+      job_recover
+      exit $? ;;
+    *) job_entry "$@" ;;
+  esac
 }

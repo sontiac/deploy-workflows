@@ -200,7 +200,7 @@ if [ "$TYPE" = node-app ] && [ -n "$OFFLINE_SCHEMA_DIR" ]; then
   say "       ($(cfg '[.processes[] | "\(.pm2_name) :\(.port)"] | join(", ")')) open; 6 tries, 5s apart"
   say "    5. on any failure after the backup: stop the processes, restore the dump in one transaction, check the"
   say "       restored schema and row counts equal the dump's, then reset to the previous commit, npm ci, build, restart."
-  say "       If the restore fails, the processes stay stopped and the log prints the commands to finish by hand (exit 30)."
+  say "       If the restore fails, nothing is started and the log prints the one command that finishes the job (job.sh --recover, exit 30)."
 elif [ "$TYPE" = node-app ]; then
   say "  On $HOST, holding the lock ~/.deploy/locks/$NAME.lock, detached from this terminal:"
   say "    git fetch + reset to ${SHA:0:12}"
@@ -299,11 +299,12 @@ compose_job() {
       printf 'PROC_BUILDS+=(%q)\n' "$(cfg "$p.build_cmd")"
       printf 'PROC_PRISMA+=(%q)\n' "$(cfg "$p.prisma_schema_dir // \"\"")"
     done
-    [ -z "$OFFLINE_SCHEMA_DIR" ] || printf 'OFFLINE_SCHEMA_DIR=%q\n' "$OFFLINE_SCHEMA_DIR"
+    # Always defined, empty unless the app opted in, so nothing inherited from the remote environment can turn it on.
+    printf 'OFFLINE_SCHEMA_DIR=%q\n' "$OFFLINE_SCHEMA_DIR"
   fi
   cat "$ROOT/lib/remote/common.sh" "$ROOT/lib/remote/$TYPE.sh"
   [ -z "$OFFLINE_SCHEMA_DIR" ] || cat "$ROOT/lib/remote/node-app-offline.sh"
-  printf '\njob_entry "$@"\n'
+  if [ -n "$OFFLINE_SCHEMA_DIR" ]; then printf '\noffline_entry "$@"\n'; else printf '\njob_entry "$@"\n'; fi
 }
 
 # Runs on the VPS: store the job, start it in its own session (it survives
@@ -343,7 +344,7 @@ case $rc in
   "$EXIT_ROLLED_BACK") say "deploy: FAILED and rolled back. $NAME is healthy on the previous version; ${SHA:0:12} is not live." ;;
   "$EXIT_ROLLBACK_FAILED")
     say "deploy: FAILED and the ROLLBACK FAILED. $NAME may be down. Act now: ssh $HOST, pm2 status, read the log above."
-    [ -z "$OFFLINE_SCHEMA_DIR" ] || say "         (If the database restore failed, $NAME is stopped on purpose; the log has the backup path and the commands to finish by hand.)" ;;
+    [ -z "$OFFLINE_SCHEMA_DIR" ] || say "         (If the database restore failed, nothing was started on purpose; the log has the backup path and the one command that finishes the job: bash ~/$RUN_DIR_REMOTE/job.sh --recover on $HOST.)" ;;
   255) detached; say "(The SSH connection to $HOST was lost.)"; rc=$EXIT_DISCONNECTED ;;
   *) say "deploy: the remote job ended unexpectedly (exit $rc). Read ~/$RUN_DIR_REMOTE/log on $HOST."; rc=$EXIT_UNKNOWN ;;
 esac

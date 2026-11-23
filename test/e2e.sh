@@ -33,8 +33,15 @@
 #   - the password appears neither in the run logs and job scripts nor in the
 #     process list during the three pauses, and never reaches the app's environment
 #   - retention keeps the newest five dumps
-#   - the restore fails (the dump is damaged after it was taken): exit 30, the
-#     processes stay stopped, the manual commands are printed, nothing is half restored
+#   - the restore fails (the dump is damaged after it was taken): exit 30, nothing
+#     is started, the true process state and `job.sh --recover` are printed,
+#     nothing is half restored; recovering with the dump still damaged ends in
+#     30 with nothing changed; with the good dump back it ends in 20 and the
+#     database is exact
+#   - retention picks by the host's modification time and never removes the current dump
+#   - the Prisma schema of the new commit must use env("DATABASE_URL") and no directUrl
+#   - an OFFLINE_SCHEMA_DIR in the remote environment does not turn an online app offline
+#   - sequence positions are restored too
 #   - deploy.json validation of "migrations"
 #
 # Not covered: a real pm2 (its stop/restart-from-stopped behaviour was checked
@@ -93,6 +100,10 @@ expect_log() {
   fi
 }
 
+expect_no_log() {
+  if grep -qF -- "$2" "$WORK/last.log"; then fail "$1: the output contains '$2'"; else pass "$1"; fi
+}
+
 commit_and_push() { git add -A && git commit -qm "$1" && git push -q origin main; }
 
 # ------------------------------------------------------------- the fake VPS
@@ -109,7 +120,7 @@ while [ \$# -gt 0 ]; do
   esac
 done
 shift # the host
-exec docker exec -i -w /root $CONTAINER bash -c "\$*"
+exec docker exec -i -w /root \${E2E_DOCKER_ARGS:-} $CONTAINER bash -c "\$*"
 EOF
 chmod +x "$WORK/bin/ssh"
 export PATH="$WORK/bin:$PATH"
@@ -241,10 +252,13 @@ EOF
   expect_equal "online app: the job differs from the baseline's by insertions only" \
     "$(diff <(printf '%s\n' "$baseline") <(printf '%s\n' "$ours") | grep -c '^<' || true)" 0
   added=$(diff <(printf '%s\n' "$baseline") <(printf '%s\n' "$ours") | sed -n 's/^> //p' | grep -v '^[[:space:]]*#' | grep -v '^[[:space:]]*$' || true)
-  expected_branch=$(printf '%s\n' '  if [ -n "${OFFLINE_SCHEMA_DIR:-}" ]; then' '    offline_release "$prev"' '    return' '  fi')
-  expect_equal "online app: the only added code is the offline branch" "$added" "$expected_branch"
-  expect_equal "online app: the job never mentions offline migrations' parameter or file" \
-    "$(printf '%s\n' "$ours" | grep -c -e '^OFFLINE_SCHEMA_DIR=' -e '^offline_preflight()' | tr -d ' ')" 0
+  expected_branch=$(printf '%s\n' "OFFLINE_SCHEMA_DIR=''" '  if [ -n "${OFFLINE_SCHEMA_DIR:-}" ]; then' '    offline_release "$prev"' '    return' '  fi')
+  expect_equal "online app: the only added code is the always-empty OFFLINE_SCHEMA_DIR and the branch on it" "$added" "$expected_branch"
+  expect_equal "online app: the job has none of the offline code" \
+    "$(printf '%s\n' "$ours" | grep -c -e '^offline_preflight()' -e '^offline_entry()' | tr -d ' ')" 0
+  # An OFFLINE_SCHEMA_DIR in the remote user's environment must not turn the offline path on for an app that did not opt in.
+  E2E_DOCKER_ARGS='-e OFFLINE_SCHEMA_DIR=.' expect_deploy "online app with OFFLINE_SCHEMA_DIR exported on the host" 0
+  expect_no_log "online app with OFFLINE_SCHEMA_DIR exported: no preflight ran" "preflight"
 
   touch fail-build && commit_and_push "C: build fails"
   expect_deploy "failed build rolls back" 20
@@ -343,6 +357,7 @@ EOF
 export PGPASSWORD='$DB_PASSWORD' PGHOST=127.0.0.1 PGUSER=appuser PGDATABASE=offdb
 echo "schema: \$(pg_dump --schema-only --restrict-key=snapshot | sha256sum)"
 psql -X -q -A -t -c "select 'table ' || tablename || ' rows=' || (xpath('/row/c/text()', query_to_xml(format('select count(*) as c from %I', tablename), false, true, '')))[1]::text || ' content=' || md5(query_to_xml(format('select * from %I order by 1', tablename), true, false, '')::text) from pg_tables where schemaname = 'public' order by tablename"
+psql -X -q -A -t -c "select 'sequence ' || sequencename || ' ' || coalesce(last_value::text, 'unused') from pg_sequences where schemaname = 'public' order by sequencename"
 psql -X -q -A -t -c "select 'owner ' || nspowner::regrole || ' ' || coalesce(nspacl::text, '') from pg_namespace where nspname = 'public'"
 EOF
   # A sampler of the process list: every 50 ms, lines naming the password (raw or percent-encoded) go to /tmp/ps-hits.
@@ -382,18 +397,16 @@ offline_scenarios() {
 EOF
   npm install --package-lock-only --silent
   mkdir -p prisma/migrations/20260101000000_init
-  cat >prisma/schema.prisma <<'EOF'
-datasource db {
-  provider = "postgresql"
-  url      = env("DATABASE_URL")
-}
-
-model Note {
-  id    Int     @id @default(autoincrement())
-  title String
-  body  String?
-}
-EOF
+  # write_schema [datasource lines...]: the schema, with the datasource's url line unless others are given
+  write_schema() {
+    mkdir -p prisma
+    {
+      printf 'datasource db {\n  provider = "postgresql"\n'
+      if [ $# -eq 0 ]; then printf '  url      = env("DATABASE_URL")\n'; else printf '  %s\n' "$@"; fi
+      printf '}\n\nmodel Note {\n  id    Int     @id @default(autoincrement())\n  title String\n  body  String?\n}\n'
+    } >prisma/schema.prisma
+  }
+  write_schema
   printf 'provider = "postgresql"\n' >prisma/migrations/migration_lock.toml
   cat >prisma/migrations/20260101000000_init/migration.sql <<'EOF'
 CREATE TABLE "Note" ("id" SERIAL NOT NULL, "title" TEXT NOT NULL, "body" TEXT, CONSTRAINT "Note_pkey" PRIMARY KEY ("id"));
@@ -413,7 +426,13 @@ const column = fs.readFileSync("column.txt", "utf8").trim();
 const status = Number(fs.readFileSync("built.txt", "utf8"));
 if (fs.existsSync("sabotage-backup")) { // test double: something damages the backups while this version starts
   const dir = path.join(os.homedir(), ".deploy/backups/e2e-offline");
-  for (const file of fs.readdirSync(dir)) if (file.endsWith(".dump")) fs.truncateSync(path.join(dir, file), 0);
+  const good = path.join(os.homedir(), "good-dumps"); // the test keeps a good copy to hand back
+  fs.mkdirSync(good, { recursive: true });
+  for (const file of fs.readdirSync(dir)) {
+    if (!file.endsWith(".dump")) continue;
+    fs.copyFileSync(path.join(dir, file), path.join(good, file));
+    fs.truncateSync(path.join(dir, file), 0);
+  }
 }
 http.createServer(async (req, res) => {
   const client = new Client({ connectionString: process.env.DATABASE_URL });
@@ -521,6 +540,7 @@ EOF
 CREATE TYPE "Kind" AS ENUM ('a', 'b');
 CREATE TABLE "Extra" ("id" SERIAL NOT NULL, "kind" "Kind" NOT NULL DEFAULT 'a', CONSTRAINT "Extra_pkey" PRIMARY KEY ("id"));
 INSERT INTO "Extra" ("kind") VALUES ('a'), ('b');
+INSERT INTO "Note" ("title", "body") VALUES ('made by the failed release', 'x'), ('and another', 'y');
 ALTER TABLE "Note" ADD COLUMN "extra" INTEGER;
 UPDATE "Note" SET "extra" = 0;
 EOF
@@ -529,13 +549,17 @@ ALTER TABLE "Note" ADD COLUMN "doomed" TEXT;
 SELECT * FROM a_table_that_does_not_exist;
 EOF
   commit_and_push "O4: two migrations, the second fails"
-  local before
+  local before sequence_before
   before=$(snapshot)
+  sequence_before=$(offsql <<<"select last_value from pg_sequences where sequencename = 'Note_id_seq'")
   reset_pm2_calls
   expect_deploy "offline, second migration fails: restored, rolled back" 20
   expect_log "second migration fails: the restore ran" "RESTORED: the database is back to what it was"
   expect_log "second migration fails: the restore was verified" "verified: the schema fingerprint and the row counts"
   expect_equal "second migration fails: database identical (schema, every table's contents, _prisma_migrations)" "$(snapshot)" "$before"
+  expect_equal "second migration fails: the Note sequence is back where it was ($sequence_before)" \
+    "$(offsql <<<"select last_value from pg_sequences where sequencename = 'Note_id_seq'")" "$sequence_before"
+  expect_equal "second migration fails: no row of the failed release" "$(offsql <<<'select count(*) from "Note"')" 40
   expect_equal "second migration fails: no table of the failed release" "$(offsql <<<"select count(*) from pg_tables where tablename = 'Extra'")" 0
   expect_equal "second migration fails: no type of the failed release" "$(offsql <<<"select count(*) from pg_type where typname = 'Kind'")" 0
   expect_equal "second migration fails: live commit is O3 again" "$(live_off)" "$O3"
@@ -641,6 +665,21 @@ EOF
   offsql <<<"select lo_unlink(424242)" >/dev/null
   untouched "a large object"
 
+  # ----- the schema Prisma will load must be the one the backup is built from (checked on the new commit)
+  write_schema 'url       = env("DATABASE_URL")' 'directUrl = env("DIRECT_URL")'
+  commit_and_push "O7a: directUrl"
+  refusal "a directUrl in the Prisma schema" "has a directUrl"
+  git revert -q --no-edit HEAD && git push -q origin main
+  write_schema 'url      = env("OTHER_URL")'
+  commit_and_push "O7b: another variable"
+  refusal "a datasource url from another variable" 'is not env("DATABASE_URL")'
+  git revert -q --no-edit HEAD && git push -q origin main
+  echo "export default {}" >prisma.config.ts
+  commit_and_push "O7c: prisma.config"
+  refusal "a prisma.config file" "a prisma.config file exists"
+  git revert -q --no-edit HEAD && git push -q origin main
+  untouched "a Prisma schema that differs"
+
   # ----- retention: the newest five dumps are kept
   mkdir prisma/migrations/20260107000000_audit
   echo 'CREATE TABLE "Audit" ("id" SERIAL NOT NULL, "note" TEXT, CONSTRAINT "Audit_pkey" PRIMARY KEY ("id"));' >prisma/migrations/20260107000000_audit/migration.sql
@@ -648,33 +687,56 @@ EOF
   local O8 n
   O8=$(git rev-parse HEAD)
   for n in 1 2 3 4 5 6 7; do
-    on_box "install -m 600 /dev/null ~/.deploy/backups/e2e-offline/2020010100000${n}Z-e2e-offline-0000000-1.dump"
+    # names that sort AFTER this run's id, modification times long before it: only the time may decide
+    on_box "install -m 600 /dev/null ~/.deploy/backups/e2e-offline/9999010100000${n}Z-fake-$n.dump && touch -d 2020-01-0$n ~/.deploy/backups/e2e-offline/9999010100000${n}Z-fake-$n.dump"
   done
   expect_equal "retention: ten dumps before the run (three real, seven made up)" "$(backup_dumps)" 10
   expect_deploy "offline, a harmless migration" 0
   expect_equal "retention: the newest five are kept" "$(backup_dumps)" 5
-  expect_equal "retention: the oldest fake dump is gone" "$(on_box 'ls ~/.deploy/backups/e2e-offline | grep -c 20200101000001Z || true' | tr -d ' ')" 0
-  expect_equal "retention: this run's dump is the newest" \
-    "$(on_box 'ls ~/.deploy/backups/e2e-offline | tail -n 1')" "$(on_box 'basename "$(ls -d ~/.deploy/runs/*/ | tail -n 1)"').dump"
+  expect_equal "retention: the dump with the oldest time is gone" "$(on_box 'ls ~/.deploy/backups/e2e-offline | grep -c 99990101000001Z || true' | tr -d ' ')" 0
+  expect_equal "retention: the newest-by-time of the made-up dumps stays" "$(on_box 'ls ~/.deploy/backups/e2e-offline | grep -c 99990101000007Z || true' | tr -d ' ')" 1
+  expect_equal "retention: this run's dump stays although its name sorts first" \
+    "$(on_box 'ls ~/.deploy/backups/e2e-offline | head -n 1')" "$(on_box 'basename "$(ls -d ~/.deploy/runs/*/ | tail -n 1)"').dump"
 
-  # ----- the restore fails: exit 30, stopped, the manual commands
+  # ----- the restore fails: exit 30, nothing started, one command to finish
   mkdir prisma/migrations/20260108000000_more
   echo 'ALTER TABLE "Audit" ADD COLUMN "extra" TEXT;' >prisma/migrations/20260108000000_more/migration.sql
   echo 500 >status.txt
   touch sabotage-backup
   commit_and_push "O9: serves 500 and damages the backup"
-  local O9
+  local O9 run_id dump_name after_failure rc
   O9=$(git rev-parse HEAD)
+  before=$(snapshot)
   expect_deploy "offline, restore fails" 30
   expect_log "restore fails: says so" "RESTORE FAILED"
+  expect_log "restore fails: pg_restore's own failure is named" "pg_restore could not read the dump"
   expect_log "restore fails: names the dump" "/root/.deploy/backups/e2e-offline/"
-  expect_log "restore fails: prints the restore command" "pg_restore -f -"
-  expect_log "restore fails: prints the code rollback" "git -C /srv/offapp reset --hard $O8"
+  expect_log "restore fails: reports the process state as pm2 sees it" "e2e-off: stopped"
+  expect_log "restore fails: prints the one recovery command" "job.sh --recover"
   expect_equal "restore fails: the process stays stopped" "$(on_box 'pm2 jlist' | grep -c '"status":"stopped"')" 1
   expect_equal "restore fails: nothing answers on the port" "$(http_code http://127.0.0.1:4125/)" 000
   expect_equal "restore fails: the aborted restore left the data in place (one transaction rolled back)" "$(offsql <<<'select count(*) from "Note"')" 40
   expect_equal "restore fails: history says restore-failed" "$(on_box 'tail -n 1 ~/.deploy/history.tsv | cut -f4')" restore-failed
   expect_equal "restore fails: the code was not rolled back" "$(live_off)" "$O9"
+
+  run_id=$(on_box 'basename "$(ls -d ~/.deploy/runs/*/ | tail -n 1)"')
+  dump_name="$run_id.dump"
+  after_failure=$(snapshot)
+  recover() { rc=0; on_box "bash ~/.deploy/runs/$run_id/job.sh --recover" >"$WORK/last.log" 2>&1 || rc=$?; }
+  recover
+  expect_equal "recover with the dump still damaged: exit 30 again" "$rc" 30
+  expect_equal "recover with the dump still damaged: database unchanged" "$(snapshot)" "$after_failure"
+  expect_equal "recover with the dump still damaged: still stopped, code untouched" \
+    "$(on_box 'pm2 jlist' | grep -c '"status":"stopped"')/$(live_off)" "1/$O9"
+  on_box "install -m 600 ~/good-dumps/$dump_name ~/.deploy/backups/e2e-offline/$dump_name"
+  recover
+  expect_equal "recover with the good dump back: exit 20" "$rc" 20
+  expect_log "recover: the restore was verified" "verified: the schema fingerprint, the row counts of every table and every sequence position"
+  expect_equal "recover: database exact (as before the failed release)" "$(snapshot)" "$before"
+  expect_equal "recover: previous code is live" "$(live_off)" "$O8"
+  expect_equal "recover: previous code healthy" "$(http_code http://127.0.0.1:4125/)" 200
+  expect_equal "recover: exit code recorded beside the run" "$(on_box "cat ~/.deploy/runs/$run_id/recover-exit-code")" 20
+  expect_equal "recover: the recovery state holds no password" "$(on_box 'grep -rlF -f /tmp/needles ~/.deploy/runs | wc -l' | tr -d ' ')" 0
 
   # ----- configuration
   cd "$WORK/offapp"
