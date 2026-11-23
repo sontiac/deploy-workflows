@@ -695,8 +695,8 @@ EOF
   expect_equal "retention: the newest five are kept" "$(backup_dumps)" 5
   expect_equal "retention: the dump with the oldest time is gone" "$(on_box 'ls ~/.deploy/backups/e2e-offline | grep -c 99990101000001Z || true' | tr -d ' ')" 0
   expect_equal "retention: the newest-by-time of the made-up dumps stays" "$(on_box 'ls ~/.deploy/backups/e2e-offline | grep -c 99990101000007Z || true' | tr -d ' ')" 1
-  expect_equal "retention: this run's dump stays although its name sorts first" \
-    "$(on_box 'ls ~/.deploy/backups/e2e-offline | head -n 1')" "$(on_box 'basename "$(ls -d ~/.deploy/runs/*/ | tail -n 1)"').dump"
+  expect_equal "retention: this run's dump stays although its name sorts before the made-up ones" \
+    "$(on_box 'ls ~/.deploy/backups/e2e-offline/"$(basename "$(ls -d ~/.deploy/runs/*/ | tail -n 1)")".dump | wc -l' | tr -d ' ')" 1
 
   # ----- the restore fails: exit 30, nothing started, one command to finish
   mkdir prisma/migrations/20260108000000_more
