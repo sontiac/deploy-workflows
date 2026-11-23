@@ -176,10 +176,10 @@ on_box 'git config --global init.defaultBranch main && git config --global safe.
 live() { on_box 'git -C /srv/app rev-parse HEAD'; }
 http_code() { on_box "curl -s -o /dev/null -w '%{http_code}' $1"; }
 
-# The newest run's job script, with the lines that name the run or the person removed.
+# The newest run's job script, with the lines that name the run, the person or the commit that was live removed.
 latest_job() {
   on_box 'cat "$(ls -d ~/.deploy/runs/*/ | tail -n 1)job.sh"' |
-    sed -E '/^# deploy job /d; s/^RUN_ID=.*/RUN_ID=<run>/; s/^DEPLOYED_BY=.*/DEPLOYED_BY=<by>/'
+    sed -E '/^# deploy job /d; s/^RUN_ID=.*/RUN_ID=<run>/; s/^DEPLOYED_BY=.*/DEPLOYED_BY=<by>/; s/^EXPECTED_PREV=.*/EXPECTED_PREV=<live commit>/'
 }
 
 # ------------------------------------------------------------- node-app and static-site
