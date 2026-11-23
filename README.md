@@ -211,8 +211,14 @@ commit, schema fingerprint, row counts and sequence positions; no password):
 stop the processes, restore the dump in one transaction, verify it, reset to
 the previous commit, `npm ci`, build, restart, health check. Same exit codes
 (20 when it works, 30 when it does not). A failed restore changes nothing (the
-transaction rolls back), so run it again after fixing what failed. It refuses
-if production has moved to another commit since the failed run. `history.tsv`
+transaction rolls back), so run it again after fixing what failed. Only an
+unfinished release can be recovered. Each app has one open recovery
+(`~/.deploy/state/<name>.recovery`, the run id): it opens when a run takes its
+dump, replacing an older one, and closes when a release ends healthy on the new
+version or a restore ends healthy on the previous one. `--recover` refuses
+(exit 10, nothing changed) unless it names that run, unless the saved state,
+the dump and `pg_restore -l` are fine and `.env` still names the database that
+was backed up, and if production has moved to another commit since the failed run. `history.tsv`
 records the failed run as `restore-failed`; the recovery's exit code lands in
 `~/.deploy/runs/<run id>/recover-exit-code`.
 
@@ -225,7 +231,8 @@ records the failed run as `restore-failed`; the recovery's exit code lands in
   `prisma/schema.prisma`, `schema.prisma`, `prisma/schema/`, or the path in
   `package.json`'s `prisma.schema`; exactly one) must declare one datasource
   with `url = env("DATABASE_URL")` and no `directUrl`, and there must be no
-  `prisma.config` file. Why: Prisma migrates through `directUrl` when there is
+  `prisma.config` or `.config/prisma` file. `migrate status` and `migrate
+  deploy` are given that same file with `--schema`. Why: Prisma migrates through `directUrl` when there is
   one, and through whatever variable `url` names. The backup is built from
   `DATABASE_URL`, so any other setup could back up one database and migrate
   another. The preflight refuses it.
@@ -252,9 +259,10 @@ records the failed run as `restore-failed`; the recovery's exit code lands in
 - A release that changes the owner, privileges or comment of schema `public`
   itself is not undone by the restore; the verification notices and the run
   ends in exit 30.
-- The app is stopped from the dump to the end of the release, so it writes
-  nothing in between. Anything else that writes to the database in that window
-  (a script, an admin tool) is lost by a restore.
+- The app is stopped from the dump until the new version starts, so it writes
+  nothing before then. From the start on, the new version takes traffic, and
+  anything it or anything else (a script, an admin tool) writes until a failed
+  release is restored is lost by the restore.
 - The role the app connects as must not hold grants on other databases or
   tablespaces: `DROP OWNED` would revoke them and no dump of this database can
   put them back. The preflight refuses.

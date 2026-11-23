@@ -38,6 +38,11 @@
 #     nothing is half restored; recovering with the dump still damaged ends in
 #     30 with nothing changed; with the good dump back it ends in 20 and the
 #     database is exact
+#   - recovery is only possible for an unfinished release: refused after a release
+#     that succeeded and after a recovery that succeeded (a later write survives),
+#     refused for another database in .env, a missing or unreadable dump (the app
+#     is left as it was); when the restore works but the code rollback fails, the
+#     log has the state and the recover command
 #   - retention picks by the host's modification time and never removes the current dump
 #   - the Prisma schema of the new commit must use env("DATABASE_URL") and no directUrl
 #   - an OFFLINE_SCHEMA_DIR in the remote environment does not turn an online app offline
@@ -374,6 +379,8 @@ touch /tmp/ps-done
 EOF
 }
 
+# recover_run <run id>: runs that run's recovery; its exit code is left in $rc
+recover_run() { rc=0; on_box "bash ~/.deploy/runs/$1/job.sh --recover" >"$WORK/last.log" 2>&1 || rc=$?; }
 reset_pm2_calls() { on_box ': >/tmp/fake-pm2/calls.log'; }
 pm2_call_count() { on_box "awk '\$2 == \"$1\"' /tmp/fake-pm2/calls.log | wc -l" | tr -d ' '; }
 snapshot() { on_box offsnapshot; }
@@ -424,6 +431,7 @@ const { Client } = require("pg");
 process.loadEnvFile(".env");
 const column = fs.readFileSync("column.txt", "utf8").trim();
 const status = Number(fs.readFileSync("built.txt", "utf8"));
+if (fs.existsSync("sabotage-rollback")) fs.writeFileSync("fail-build", ""); // test double: the code rollback's build will fail
 if (fs.existsSync("sabotage-backup")) { // test double: something damages the backups while this version starts
   const dir = path.join(os.homedir(), ".deploy/backups/e2e-offline");
   const good = path.join(os.homedir(), "good-dumps"); // the test keeps a good copy to hand back
@@ -674,6 +682,14 @@ EOF
   commit_and_push "O7b: another variable"
   refusal "a datasource url from another variable" 'is not env("DATABASE_URL")'
   git revert --no-edit HEAD >/dev/null && git push -q origin main
+  write_schema '/*' 'url = env("DATABASE_URL")' '*/' 'url = env("OTHER_URL")'
+  commit_and_push "O7b2: the right url only inside a block comment"
+  refusal "a url that is only in a block comment" 'is not env("DATABASE_URL")'
+  git revert --no-edit HEAD >/dev/null && git push -q origin main
+  mkdir -p .config && echo "export default {}" >.config/prisma.ts
+  commit_and_push "O7b3: .config/prisma"
+  refusal "a .config/prisma file" "a .config/prisma file exists"
+  git revert --no-edit HEAD >/dev/null && git push -q origin main
   echo "export default {}" >prisma.config.ts
   commit_and_push "O7c: prisma.config"
   refusal "a prisma.config file" "a prisma.config file exists"
@@ -698,13 +714,66 @@ EOF
   expect_equal "retention: this run's dump stays although its name sorts before the made-up ones" \
     "$(on_box 'ls ~/.deploy/backups/e2e-offline/"$(basename "$(ls -d ~/.deploy/runs/*/ | tail -n 1)")".dump | wc -l' | tr -d ' ')" 1
 
+  # ----- a release that succeeded cannot be "recovered" (that would put an old backup over live data)
+  local ok_run
+  ok_run=$(on_box 'basename "$(ls -d ~/.deploy/runs/*/ | tail -n 1)"')
+  before=$(snapshot)
+  reset_pm2_calls
+  recover_run "$ok_run"
+  expect_equal "recover on a release that succeeded: refused (exit 10)" "$rc" 10
+  expect_log "recover on a release that succeeded: says why" "has no open recovery"
+  expect_equal "recover on a release that succeeded: nothing stopped" "$(pm2_call_count stop)" 0
+  expect_equal "recover on a release that succeeded: database unchanged" "$(snapshot)" "$before"
+  expect_equal "recover on a release that succeeded: app still answers" "$(http_code http://127.0.0.1:4125/)" 200
+
+  # ----- the restore works but the code rollback fails (exit 30): recoverable, and --recover validates before it acts
+  mkdir prisma/migrations/20260108000000_rbk
+  echo 'ALTER TABLE "Audit" ADD COLUMN "late" TEXT;' >prisma/migrations/20260108000000_rbk/migration.sql
+  echo 500 >status.txt
+  touch sabotage-rollback
+  commit_and_push "O8b: serves 500 and makes the rollback build fail"
+  before=$(snapshot)
+  expect_deploy "offline, restore works but the code rollback fails" 30
+  expect_log "rollback fails: the restore had worked" "RESTORED: the database is back"
+  expect_log "rollback fails: says the code rollback failed" "the code rollback failed"
+  expect_log "rollback fails: prints the recover command" "job.sh --recover"
+  expect_log "rollback fails: reports the process state" "e2e-off: stopped"
+  expect_equal "rollback fails: database exact" "$(snapshot)" "$before"
+  local run_id dump_name after_failure rc
+  run_id=$(on_box 'basename "$(ls -d ~/.deploy/runs/*/ | tail -n 1)"')
+  expect_equal "rollback fails: the recovery stays open" "$(on_box 'cat ~/.deploy/state/e2e-offline.recovery')" "$run_id"
+  on_box 'sed -i "s/@127.0.0.1/@localhost/" /srv/offapp/.env'
+  recover_run "$run_id"
+  expect_equal "recover with another database in .env: refused (exit 10)" "$rc" 10
+  expect_log "recover with another database in .env: says why" "not the database that was backed up"
+  on_box 'cp /root/env.good /srv/offapp/.env'
+  on_box "mv ~/.deploy/backups/e2e-offline/$run_id.dump /root/dump.away"
+  recover_run "$run_id"
+  expect_equal "recover with the dump missing: refused (exit 10)" "$rc" 10
+  expect_log "recover with the dump missing: says why" "does not exist"
+  on_box "mv /root/dump.away ~/.deploy/backups/e2e-offline/$run_id.dump"
+  expect_equal "recover refusals: the app was left stopped, as it was" "$(on_box 'pm2 jlist' | grep -c '"status":"stopped"')" 1
+  on_box 'rm /srv/offapp/fail-build'
+  recover_run "$run_id"
+  expect_equal "recover after the cause is fixed: exit 20" "$rc" 20
+  expect_equal "recover: database exact" "$(snapshot)" "$before"
+  expect_equal "recover: previous code healthy" "$(http_code http://127.0.0.1:4125/)" 200
+  expect_equal "recover: the recovery is closed" "$(on_box 'ls ~/.deploy/state/e2e-offline.recovery 2>/dev/null | wc -l' | tr -d ' ')" 0
+  offsql <<<"insert into \"Note\" (title) values ('written after the recovery')"
+  recover_run "$run_id"
+  expect_equal "recover a second time: refused (exit 10)" "$rc" 10
+  expect_equal "recover a second time: what was written since is still there" "$(offsql <<<"select count(*) from \"Note\" where title = 'written after the recovery'")" 1
+  offsql <<<"delete from \"Note\" where title = 'written after the recovery'"
+  git rm -q sabotage-rollback
+  git rm -rq prisma/migrations/20260108000000_rbk
+
   # ----- the restore fails: exit 30, nothing started, one command to finish
-  mkdir prisma/migrations/20260108000000_more
-  echo 'ALTER TABLE "Audit" ADD COLUMN "extra" TEXT;' >prisma/migrations/20260108000000_more/migration.sql
+  mkdir prisma/migrations/20260109000000_more
+  echo 'ALTER TABLE "Audit" ADD COLUMN "extra" TEXT;' >prisma/migrations/20260109000000_more/migration.sql
   echo 500 >status.txt
   touch sabotage-backup
   commit_and_push "O9: serves 500 and damages the backup"
-  local O9 run_id dump_name after_failure rc
+  local O9
   O9=$(git rev-parse HEAD)
   before=$(snapshot)
   expect_deploy "offline, restore fails" 30
@@ -722,14 +791,14 @@ EOF
   run_id=$(on_box 'basename "$(ls -d ~/.deploy/runs/*/ | tail -n 1)"')
   dump_name="$run_id.dump"
   after_failure=$(snapshot)
-  recover() { rc=0; on_box "bash ~/.deploy/runs/$run_id/job.sh --recover" >"$WORK/last.log" 2>&1 || rc=$?; }
-  recover
-  expect_equal "recover with the dump still damaged: exit 30 again" "$rc" 30
+  recover_run "$run_id"
+  expect_equal "recover with the dump still damaged: refused before anything is stopped or restored (exit 10)" "$rc" 10
+  expect_log "recover with the dump still damaged: says why" "pg_restore cannot read the backup"
   expect_equal "recover with the dump still damaged: database unchanged" "$(snapshot)" "$after_failure"
   expect_equal "recover with the dump still damaged: still stopped, code untouched" \
     "$(on_box 'pm2 jlist' | grep -c '"status":"stopped"')/$(live_off)" "1/$O9"
   on_box "install -m 600 ~/good-dumps/$dump_name ~/.deploy/backups/e2e-offline/$dump_name"
-  recover
+  recover_run "$run_id"
   expect_equal "recover with the good dump back: exit 20" "$rc" 20
   expect_log "recover: the restore was verified" "verified: the schema fingerprint, the row counts of every table and every sequence position"
   expect_equal "recover: database exact (as before the failed release)" "$(snapshot)" "$before"

@@ -29,6 +29,8 @@ FINGERPRINT_RESTRICT_KEY=deploy
 DB_URL="" DB_HOST="" DB_PORT="" DB_USER="" DB_PASSWORD="" DB_NAME="" DB_SSLMODE=""
 # What the database looked like when it was dumped, filled in by dump_database.
 DB_FINGERPRINT="" DB_ROW_COUNTS="" DB_SEQUENCES=""
+# The schema file (or directory) the preflight checked; prisma is told to use exactly it.
+OFFLINE_SCHEMA_PATH=""
 
 # Reads DATABASE_URL from the .env in the schema directory, the way prisma
 # does, and prints it as NUL-terminated fields: url, host, port, user,
@@ -165,7 +167,7 @@ SQL
 # is one, and through whatever variable `url` names, so the backup (built from DATABASE_URL)
 # would otherwise be of another database than the one the migrations change.
 read -r -d '' PRISMA_DATASOURCE_CHECK <<'JS'
-const text = require("fs").readFileSync(0, "utf8").replace(/\/\/.*$/gm, "");
+const text = require("fs").readFileSync(0, "utf8").replace(/\/\*[\s\S]*?\*\//g, "").replace(/\/\/.*$/gm, "");
 const refuse = (message) => {
   console.error(message);
   process.exit(2);
@@ -199,6 +201,10 @@ check_prisma_schema() {
     log "PREFLIGHT: a prisma.config file exists in $OFFLINE_SCHEMA_DIR; it can change the schema and the datasource, which this tool does not follow"
     return 1
   fi
+  if git -C "$REMOTE_PATH" ls-tree --name-only "$SHA" "${prefix}.config/" | grep -Eq '(^|/)prisma\.[a-z]+$'; then
+    log "PREFLIGHT: a .config/prisma file exists in $OFFLINE_SCHEMA_DIR; it can change the schema and the datasource, which this tool does not follow"
+    return 1
+  fi
   setting=$(git -C "$REMOTE_PATH" show "$SHA:${prefix}package.json" 2>/dev/null | node -e "$PRISMA_SCHEMA_SETTING") ||
     { log "PREFLIGHT: could not read package.json in $OFFLINE_SCHEMA_DIR"; return 1; }
   if [ -n "$setting" ]; then
@@ -223,6 +229,7 @@ check_prisma_schema() {
   [ "${#files[@]}" -gt 0 ] || { log "PREFLIGHT: no .prisma file under $path"; return 1; }
   for candidate in "${files[@]}"; do git -C "$REMOTE_PATH" show "$SHA:$candidate"; done |
     node -e "$PRISMA_DATASOURCE_CHECK" || { log "PREFLIGHT: the Prisma schema in $path cannot be backed up reliably (see above)"; return 1; }
+  OFFLINE_SCHEMA_PATH="$REMOTE_PATH/$path" # what migrate status and migrate deploy are told to load
   log "ok: the Prisma schema ($path) uses env(\"DATABASE_URL\") and no directUrl"
 }
 
@@ -332,16 +339,22 @@ save_recovery_state() {
       printf '%s\n' "$prev" >"$dir/prev" &&
       printf '%s\n' "$DB_FINGERPRINT" >"$dir/fingerprint" &&
       printf '%s\n' "$DB_ROW_COUNTS" >"$dir/row-counts" &&
-      printf '%s\n' "$DB_SEQUENCES" >"$dir/sequences"
+      printf '%s\n' "$DB_SEQUENCES" >"$dir/sequences" &&
+      printf '%s\n' "$DB_HOST" "$DB_PORT" "$DB_NAME" "$DB_USER" >"$dir/database" &&
+      printf '%s\n' "$RUN_ID" >"$DEPLOY_HOME/state/$NAME.recovery" # opens this run's recovery, superseding any older one
   ) || { log "could not save the recovery state in $dir"; return 1; }
 }
 
-# Sets REC_DUMP REC_PREV and the recorded database state from a run's recovery state.
+# The recovery of the release that ended well is over: there is nothing to recover to.
+close_recovery() { rm -f "$DEPLOY_HOME/state/$NAME.recovery"; }
+
+# Sets REC_DUMP REC_PREV REC_DATABASE (host, port, name, user) and the recorded database state from a run's recovery state.
 load_recovery_state() {
   local dir="$RUN_DIR/recovery"
   [ -f "$dir/dump" ] || return 1
   REC_DUMP=$(<"$dir/dump") && REC_PREV=$(<"$dir/prev") && DB_FINGERPRINT=$(<"$dir/fingerprint") &&
-    DB_ROW_COUNTS=$(<"$dir/row-counts") && DB_SEQUENCES=$(<"$dir/sequences")
+    DB_ROW_COUNTS=$(<"$dir/row-counts") && DB_SEQUENCES=$(<"$dir/sequences") &&
+    mapfile -t REC_DATABASE <"$dir/database"
 }
 
 # Keeps the BACKUP_KEEP newest dumps of this app, the current one always among
@@ -414,14 +427,14 @@ stop_processes() {
 # 1; the preflight has already ruled out the last two, which leaves pending.
 migrations_pending() {
   section "prisma migrate status (in $OFFLINE_SCHEMA_DIR)"
-  prisma_tool migrate status
+  prisma_tool migrate status --schema "$OFFLINE_SCHEMA_PATH"
   [ $? -ne 0 ]
 }
 
 # After a failed restore: the true state of every process, and the one command that finishes the job.
 report_recovery() {
-  local dump=$1 i
-  log "The database could not be put back. Nothing was started: the old code must not run on a database in an unknown state."
+  local headline=$1 dump=$2 i
+  log "$headline"
   log "State of the processes now, as pm2 reports it:"
   for i in "${!PROC_NAMES[@]}"; do
     log "    ${PROC_NAMES[$i]}: $(pm2_status "${PROC_NAMES[$i]}")"
@@ -434,22 +447,30 @@ report_recovery() {
 
 # A failure after the dump: stop everything, restore, verify, then the usual code rollback.
 offline_restore_and_rollback() {
-  local prev=$1 dump=$2
+  local prev=$1 dump=$2 rc
   section "RESTORE the database from $dump"
   if stop_processes && restore_database "$dump" && verify_restore; then
     log "RESTORED: the database is back to what it was before the migrations."
   else
     log "RESTORE FAILED: the database may not be in the state it was dumped in."
-    report_recovery "$dump"
+    report_recovery "The database could not be put back. Nothing was started: the old code must not run on a database in an unknown state." "$dump"
     record_history restore-failed
     return "$EXIT_ROLLBACK_FAILED"
   fi
   rollback "$prev"
+  rc=$?
+  case $rc in
+    "$EXIT_ROLLED_BACK") close_recovery ;;
+    "$EXIT_ROLLBACK_FAILED")
+      report_recovery "The database was restored, but the code rollback failed. The app is not serving a half state of the database." "$dump" ;;
+  esac
+  return "$rc"
 }
 
 offline_deployed() {
   local prev=$1
   log "DEPLOYED: $NAME is on ${SHA:0:12} and healthy (was ${prev:0:12})."
+  close_recovery
   record_history deployed
   return "$EXIT_OK"
 }
@@ -481,7 +502,7 @@ offline_window() {
 
   # From here the database changes, so every failure restores the backup.
   section "prisma migrate deploy (in $OFFLINE_SCHEMA_DIR)"
-  if prisma_tool migrate deploy && restart_processes; then
+  if prisma_tool migrate deploy --schema "$OFFLINE_SCHEMA_PATH" && restart_processes; then
     section "health check"
     if check_health; then
       offline_deployed "$prev"
@@ -528,15 +549,26 @@ offline_release() {
 # job.sh --recover: finishes a release whose restore failed. The same sequence
 # as a failure in the pause, from the state saved when the dump was taken.
 job_recover() {
-  local head
+  local head open
   section "RECOVER run $RUN_ID: restore the backup, then put the previous code back"
-  load_recovery_state || { refuse "run $RUN_ID took no backup, so there is nothing to recover"; return; }
+  # Everything is checked before a process is stopped; any problem leaves the app as it is.
+  open=$(cat "$DEPLOY_HOME/state/$NAME.recovery" 2>/dev/null)
+  [ "$open" = "$RUN_ID" ] || { refuse "run $RUN_ID has no open recovery (open: ${open:-none}); it succeeded, was recovered already, or a newer release superseded it"; return; }
+  load_recovery_state || { refuse "the recovery state of run $RUN_ID is missing or incomplete"; return; }
+  [[ $DB_FINGERPRINT =~ ^[0-9a-f]{64}$ ]] && [ -n "$DB_ROW_COUNTS" ] && git -C "$REMOTE_PATH" cat-file -e "$REC_PREV^{commit}" 2>/dev/null &&
+    [ "${#REC_DATABASE[@]}" -eq 4 ] || { refuse "the recovery state of run $RUN_ID is not well formed"; return; }
   head=$(git -C "$REMOTE_PATH" rev-parse HEAD) || { refuse "$REMOTE_PATH is not a git checkout"; return; }
   if [ "$head" != "$SHA" ] && [ "$head" != "$REC_PREV" ]; then
     refuse "production is at ${head:0:12}, not on run $RUN_ID's ${SHA:0:12} or ${REC_PREV:0:12}; a later deploy happened, so this backup is out of date"
     return
   fi
+  [ -f "$REC_DUMP" ] || { refuse "the backup $REC_DUMP does not exist"; return; }
+  pg_restore -l "$REC_DUMP" >/dev/null || { refuse "pg_restore cannot read the backup $REC_DUMP"; return; }
   load_database_url || { refuse "DATABASE_URL could not be used (see above)"; return; }
+  if [ "${REC_DATABASE[0]}|${REC_DATABASE[1]}|${REC_DATABASE[2]}|${REC_DATABASE[3]}" != "$DB_HOST|$DB_PORT|$DB_NAME|$DB_USER" ]; then
+    refuse "DATABASE_URL now names $DB_USER@$DB_HOST:$DB_PORT/$DB_NAME, not the database that was backed up (${REC_DATABASE[3]}@${REC_DATABASE[0]}:${REC_DATABASE[1]}/${REC_DATABASE[2]})"
+    return
+  fi
   offline_restore_and_rollback "$REC_PREV" "$REC_DUMP"
 }
 
