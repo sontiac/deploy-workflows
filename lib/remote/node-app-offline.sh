@@ -239,6 +239,13 @@ offline_preflight() {
   local cmd value version server_version_num blocks block_size free size
 
   section "preflight: can the database be backed up and restored?"
+  if [ -e "$DEPLOY_HOME/state/$NAME.recovery" ]; then
+    value=$(cat "$DEPLOY_HOME/state/$NAME.recovery" 2>/dev/null)
+    log "PREFLIGHT: the release of run ${value:-?} is not settled: its database restore or code rollback did not finish."
+    log "    Finish it with: bash $DEPLOY_HOME/runs/${value:-<run id>}/job.sh --recover"
+    log "    If you settled the database by hand instead, delete $DEPLOY_HOME/state/$NAME.recovery and deploy again."
+    return 1
+  fi
   for cmd in pg_dump pg_restore psql node; do
     command -v "$cmd" >/dev/null 2>&1 || { log "PREFLIGHT: $cmd is not installed on this host"; return 1; }
   done
@@ -341,12 +348,15 @@ save_recovery_state() {
       printf '%s\n' "$DB_ROW_COUNTS" >"$dir/row-counts" &&
       printf '%s\n' "$DB_SEQUENCES" >"$dir/sequences" &&
       printf '%s\n' "$DB_HOST" "$DB_PORT" "$DB_NAME" "$DB_USER" >"$dir/database" &&
-      printf '%s\n' "$RUN_ID" >"$DEPLOY_HOME/state/$NAME.recovery" # opens this run's recovery, superseding any older one
+      printf '%s\n' "$RUN_ID" >"$DEPLOY_HOME/state/$NAME.recovery" # opens this run's recovery; the preflight refuses while one is open
   ) || { log "could not save the recovery state in $dir"; return 1; }
 }
 
 # The recovery of the release that ended well is over: there is nothing to recover to.
-close_recovery() { rm -f "$DEPLOY_HOME/state/$NAME.recovery"; }
+close_recovery() {
+  rm -f "$DEPLOY_HOME/state/$NAME.recovery" ||
+    log "WARNING: could not delete $DEPLOY_HOME/state/$NAME.recovery. Delete it by hand, and do NOT run --recover for run $RUN_ID: it would restore an old backup over live data."
+}
 
 # Sets REC_DUMP REC_PREV REC_DATABASE (host, port, name, user) and the recorded database state from a run's recovery state.
 load_recovery_state() {
@@ -555,7 +565,7 @@ job_recover() {
   open=$(cat "$DEPLOY_HOME/state/$NAME.recovery" 2>/dev/null)
   [ "$open" = "$RUN_ID" ] || { refuse "run $RUN_ID has no open recovery (open: ${open:-none}); it succeeded, was recovered already, or a newer release superseded it"; return; }
   load_recovery_state || { refuse "the recovery state of run $RUN_ID is missing or incomplete"; return; }
-  [[ $DB_FINGERPRINT =~ ^[0-9a-f]{64}$ ]] && [ -n "$DB_ROW_COUNTS" ] && git -C "$REMOTE_PATH" cat-file -e "$REC_PREV^{commit}" 2>/dev/null &&
+  [[ $DB_FINGERPRINT =~ ^[0-9a-f]{64}$ ]] && git -C "$REMOTE_PATH" cat-file -e "$REC_PREV^{commit}" 2>/dev/null &&
     [ "${#REC_DATABASE[@]}" -eq 4 ] || { refuse "the recovery state of run $RUN_ID is not well formed"; return; }
   head=$(git -C "$REMOTE_PATH" rev-parse HEAD) || { refuse "$REMOTE_PATH is not a git checkout"; return; }
   if [ "$head" != "$SHA" ] && [ "$head" != "$REC_PREV" ]; then
@@ -565,7 +575,8 @@ job_recover() {
   [ -f "$REC_DUMP" ] || { refuse "the backup $REC_DUMP does not exist"; return; }
   pg_restore -l "$REC_DUMP" >/dev/null || { refuse "pg_restore cannot read the backup $REC_DUMP"; return; }
   load_database_url || { refuse "DATABASE_URL could not be used (see above)"; return; }
-  if [ "${REC_DATABASE[0]}|${REC_DATABASE[1]}|${REC_DATABASE[2]}|${REC_DATABASE[3]}" != "$DB_HOST|$DB_PORT|$DB_NAME|$DB_USER" ]; then
+  if [ "${REC_DATABASE[0]}" != "$DB_HOST" ] || [ "${REC_DATABASE[1]}" != "$DB_PORT" ] ||
+    [ "${REC_DATABASE[2]}" != "$DB_NAME" ] || [ "${REC_DATABASE[3]}" != "$DB_USER" ]; then
     refuse "DATABASE_URL now names $DB_USER@$DB_HOST:$DB_PORT/$DB_NAME, not the database that was backed up (${REC_DATABASE[3]}@${REC_DATABASE[0]}:${REC_DATABASE[1]}/${REC_DATABASE[2]})"
     return
   fi

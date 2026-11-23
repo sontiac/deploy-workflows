@@ -43,6 +43,7 @@
 #     refused for another database in .env, a missing or unreadable dump (the app
 #     is left as it was); when the restore works but the code rollback fails, the
 #     log has the state and the recover command
+#   - an open recovery blocks the next release (exit 10) until it is recovered
 #   - retention picks by the host's modification time and never removes the current dump
 #   - the Prisma schema of the new commit must use env("DATABASE_URL") and no directUrl
 #   - an OFFLINE_SCHEMA_DIR in the remote environment does not turn an online app offline
@@ -742,6 +743,12 @@ EOF
   local run_id dump_name after_failure rc
   run_id=$(on_box 'basename "$(ls -d ~/.deploy/runs/*/ | tail -n 1)"')
   expect_equal "rollback fails: the recovery stays open" "$(on_box 'cat ~/.deploy/state/e2e-offline.recovery')" "$run_id"
+  reset_pm2_calls
+  expect_deploy "an open recovery blocks the next release: refused (exit 10)" 10
+  expect_log "an open recovery blocks the next release: names the run's recover command" "$run_id/job.sh --recover"
+  expect_log "an open recovery blocks the next release: names the way out" "delete /root/.deploy/state/e2e-offline.recovery"
+  expect_equal "an open recovery blocks the next release: nothing stopped or restarted" "$(pm2_call_count stop)$(pm2_call_count restart)" "00"
+  expect_equal "an open recovery blocks the next release: database unchanged" "$(snapshot)" "$before"
   on_box 'sed -i "s/@127.0.0.1/@localhost/" /srv/offapp/.env'
   recover_run "$run_id"
   expect_equal "recover with another database in .env: refused (exit 10)" "$rc" 10
@@ -777,6 +784,7 @@ EOF
   O9=$(git rev-parse HEAD)
   before=$(snapshot)
   expect_deploy "offline, restore fails" 30
+  expect_log "after the recovery was closed, the next deploy gets through its preflight" "preflight passed"
   expect_log "restore fails: says so" "RESTORE FAILED"
   expect_log "restore fails: pg_restore's own failure is named" "pg_restore could not read the dump"
   expect_log "restore fails: names the dump" "/root/.deploy/backups/e2e-offline/"

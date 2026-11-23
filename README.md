@@ -214,8 +214,13 @@ the previous commit, `npm ci`, build, restart, health check. Same exit codes
 transaction rolls back), so run it again after fixing what failed. Only an
 unfinished release can be recovered. Each app has one open recovery
 (`~/.deploy/state/<name>.recovery`, the run id): it opens when a run takes its
-dump, replacing an older one, and closes when a release ends healthy on the new
-version or a restore ends healthy on the previous one. `--recover` refuses
+dump, and closes only when that run ends healthy on the new version, when a
+restore ends healthy on the previous one (automatic or by `--recover`), or when
+you delete the file by hand after settling the database yourself. While one is
+open the preflight of every later release refuses (exit 10, nothing changed)
+and names the run, its recover command and the file to delete. If deleting the
+file fails after a healthy release, the log warns loudly: delete it by hand and
+do not run `--recover`. `--recover` refuses
 (exit 10, nothing changed) unless it names that run, unless the saved state,
 the dump and `pg_restore -l` are fine and `.env` still names the database that
 was backed up, and if production has moved to another commit since the failed run. `history.tsv`
