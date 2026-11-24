@@ -815,6 +815,44 @@ EOF
   expect_equal "recover: exit code recorded beside the run" "$(on_box "cat ~/.deploy/runs/$run_id/recover-exit-code")" 20
   expect_equal "recover: the recovery state holds no password" "$(on_box 'grep -rlF -f /tmp/needles ~/.deploy/runs | wc -l' | tr -d ' ')" 0
 
+  # ----- another role holds privileges: the order of an ACL's entries is not part of the schema
+  # DROP OWNED leaves schema public (owned by pg_database_owner) in place, so the restore appends appuser's
+  # entry at the end of its ACL: the same privileges in another order. That must not fail the verification.
+  git rm -q sabotage-backup
+  echo 200 >status.txt
+  on_box 'rm -f /srv/offapp/fail-build' # the rollback's build must not be blocked by an earlier test double
+  on_box "su postgres -c 'psql -X -q -v ON_ERROR_STOP=1 -d offdb'" <<'SQL'
+CREATE ROLE reader NOLOGIN;
+GRANT USAGE, CREATE ON SCHEMA public TO appuser;
+REVOKE CREATE ON SCHEMA public FROM PUBLIC;
+GRANT USAGE ON SCHEMA public TO reader;
+GRANT SELECT ("title") ON "Note" TO reader;
+SQL
+  local acl_before reader_before
+  acl_before=$(offsql <<<"select string_agg(a::text, ',' order by a::text) from (select unnest(nspacl) a from pg_namespace where nspname = 'public') x")
+  reader_before=$(offsql <<<"select attacl from pg_attribute where attrelid = '\"Note\"'::regclass and attname = 'title'")
+  expect_equal "other role: reader holds usage on public and select on Note.title" \
+    "$(offsql <<<"select has_schema_privilege('reader', 'public', 'USAGE') and has_column_privilege('reader', '\"Note\"', 'title', 'SELECT')")" t
+  mkdir prisma/migrations/20260110000000_acl_fails
+  echo 'SELECT * FROM a_table_that_does_not_exist;' >prisma/migrations/20260110000000_acl_fails/migration.sql
+  commit_and_push "O9b: a failing migration while another role holds privileges"
+  reset_pm2_calls
+  expect_deploy "offline, failed release with another role holding privileges: restored, rolled back" 20
+  expect_log "other role: the restore was verified" "verified: the schema fingerprint, the row counts of every table and every sequence position"
+  expect_equal "other role: reader still holds its privileges" \
+    "$(offsql <<<"select has_schema_privilege('reader', 'public', 'USAGE') and has_column_privilege('reader', '\"Note\"', 'title', 'SELECT')")" t
+  expect_equal "other role: the column grant is the same" \
+    "$(offsql <<<"select attacl from pg_attribute where attrelid = '\"Note\"'::regclass and attname = 'title'")" "$reader_before"
+  expect_equal "other role: schema public holds the same set of ACL entries" \
+    "$(offsql <<<"select string_agg(a::text, ',' order by a::text) from (select unnest(nspacl) a from pg_namespace where nspname = 'public') x")" "$acl_before"
+  expect_equal "other role: previous code healthy" "$(http_code http://127.0.0.1:4125/)" 200
+  git rm -rq prisma/migrations/20260110000000_acl_fails
+  on_box "su postgres -c 'psql -X -q -v ON_ERROR_STOP=1 -d offdb'" <<'SQL'
+DROP OWNED BY reader;
+DROP ROLE reader;
+REVOKE ALL ON SCHEMA public FROM appuser;
+SQL
+
   # ----- configuration
   cd "$WORK/offapp"
   jq 'del(.processes[0].prisma_schema_dir)' deploy.json >deploy.tmp && mv deploy.tmp deploy.json

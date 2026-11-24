@@ -124,10 +124,17 @@ prisma_tool() {
 }
 
 # A hash of the schema (objects, owners, privileges). The restrict key pins
-# the random one pg_dump would otherwise put in every dump.
+# the random one pg_dump would otherwise put in every dump. pg_dump prints one
+# GRANT or REVOKE line per entry of an object's ACL, in ACL order, and the
+# order of the entries is not part of the schema: DROP OWNED leaves an object
+# the role does not own (schema public) in place and the restore appends the
+# role's entries again at the end of its ACL. So the privilege lines are put
+# in a fixed order (C locale) and every other line keeps its place. A failed
+# pg_dump gives no fingerprint.
 schema_fingerprint() {
-  local out
-  out=$(db_tool pg_dump -w --schema-only --restrict-key="$FINGERPRINT_RESTRICT_KEY" | sha256sum) || return 1
+  local dump out
+  dump=$(db_tool pg_dump -w --schema-only --restrict-key="$FINGERPRINT_RESTRICT_KEY") || return 1
+  out=$({ awk '!/^(GRANT|REVOKE) /' <<<"$dump"; awk '/^(GRANT|REVOKE) /' <<<"$dump" | LC_ALL=C sort; } | sha256sum) || return 1
   printf '%s' "${out%% *}"
 }
 
