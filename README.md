@@ -181,7 +181,8 @@ nothing.
    migration and for an unreachable database alike; the preflight already
    excluded the last two).
 4. **The pause.** `pm2 stop` every process; take a schema fingerprint (a hash
-   of `pg_dump --schema-only`), the row count of every table and the position of
+   of `pg_dump --schema-only`, with its GRANT and REVOKE lines sorted, since the order of an
+   object's privilege entries is not part of the schema and a restore can change it), the row count of every table and the position of
    every sequence; dump the
    database (`pg_dump -Fc`) to `~/.deploy/backups/<name>/<run id>.dump`; `prisma
    migrate deploy`; `pm2 restart` every process (which starts a stopped
@@ -212,7 +213,10 @@ stop the processes, restore the dump in one transaction, verify it, reset to
 the previous commit, `npm ci`, build, restart, health check. Same exit codes
 (20 when it works, 30 when it does not). A failed restore changes nothing (the
 transaction rolls back), so run it again after fixing what failed. Only an
-unfinished release can be recovered. Each app has one open recovery
+unfinished release can be recovered. A recovery opened by an older version of this tool
+(schema fingerprint taken without sorting the privilege lines) is finished with that version:
+the fingerprint recorded then is compared by this version's method, and a database with
+several roles holding privileges would not match. Each app has one open recovery
 (`~/.deploy/state/<name>.recovery`, the run id): it opens when a run takes its
 dump, and closes only when that run ends healthy on the new version, when a
 restore ends healthy on the previous one (automatic or by `--recover`), or when
